@@ -99,9 +99,14 @@ fn append<W: Write>(
     Ok(())
 }
 
-/// Streams the package's files for `items` as a gzipped tar into `w`. `progress` gets the
-/// compressed bytes written so far.
-pub fn write_files<W: Write>(items: &[Item], w: W, progress: impl Fn(u64)) -> Result<()> {
+/// Streams the package's files for `items` as a gzipped tar into `w`. `on_item` hears which
+/// item is being packed; `progress` gets the compressed bytes written so far.
+pub fn write_files<W: Write>(
+    items: &[Item],
+    w: W,
+    on_item: impl Fn(usize, &Item),
+    progress: impl Fn(u64),
+) -> Result<()> {
     let counting = Counting {
         inner: w,
         total: 0,
@@ -111,7 +116,10 @@ pub fn write_files<W: Write>(items: &[Item], w: W, progress: impl Fn(u64)) -> Re
     let mut tar = tar::Builder::new(gz);
     tar.follow_symlinks(false);
     let home = inventory::home();
-    for it in items {
+    for (i, it) in items.iter().enumerate() {
+        if it.kind.has_files() {
+            on_item(i, it);
+        }
         match it.kind {
             Kind::Dotfile => append(
                 &mut tar,

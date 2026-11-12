@@ -50,6 +50,13 @@ credentials (`~/.ssh`, `~/.aws`, `~/.config/gh`…) are flagged.
 5. The package arrives under **Received**. Untick anything you don't want, then
    **Apply to this Mac**.
 
+While a package moves, both Macs switch to a transfer screen with each step, the code,
+progress, speed, time left and an activity log. The package is packed into a file first, so a
+dropped or stalled connection is retried automatically (with backoff, up to 30 attempts) and
+picks up at the byte where it stopped, without a new code. The receiver checks the size and
+SHA-256 before filing it; a damaged package is sent again. An interrupted transfer also
+resumes after the receiving Mac's macpack restarts.
+
 Applying copies files first (so apps find their settings when they're installed), then runs
 `brew bundle`, then imports preferences. A file that would be replaced is moved to
 `~/.local/share/macpack/applied/<time>/backup/` first. Homebrew must be installed on the new Mac
@@ -66,6 +73,8 @@ macpack found as JSON.
   have different keys with each Mac, so the codes wouldn't match. The sender commits to its
   key before seeing the receiver's, so an attacker can't search for keys that produce
   matching codes.
+- Reconnects of an accepted transfer mix a secret from the verified first connection into
+  their keys, so they need no new code and can't be taken over by anyone else.
 - Nothing is accepted without a click on the receiving Mac, and nothing is applied until you
   review the package.
 - Received packages hold your keys. They're stored owner-only in
