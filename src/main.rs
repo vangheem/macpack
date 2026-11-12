@@ -10,7 +10,7 @@ mod package;
 mod store;
 mod update;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
@@ -83,7 +83,16 @@ struct App {
     inventory: Option<Inventory>,
     scanning: bool,
     collapsed: HashSet<(bool, Kind)>,
+    /// Found on the network and added by hand, merged.
     peers: Vec<Peer>,
+    found: Vec<Peer>,
+    /// Manual peer id → its name and version once it answered, or why it didn't.
+    reach: HashMap<String, Result<(String, String), String>>,
+    /// The port this Mac listens on.
+    port: Option<u16>,
+    connect: Option<TextEdit>,
+    /// This Mac's LAN addresses, shown so they can be typed on the other Mac.
+    my_ips: Vec<std::net::Ipv4Addr>,
     net_error: Option<String>,
     _mdns: Option<mdns_sd::ServiceDaemon>,
     sending: Option<Sending>,
@@ -126,6 +135,11 @@ fn init() -> App {
             .map(|k| (false, k))
             .collect(),
         peers: Vec::new(),
+        found: Vec::new(),
+        reach: HashMap::new(),
+        port: None,
+        connect: None,
+        my_ips: Vec::new(),
         net_error: None,
         _mdns: None,
         sending: None,
@@ -152,6 +166,7 @@ fn init() -> App {
 
 /// Bridges the network listener to the UI: offers become a dialog, results become jobs.
 struct UiReceiver {
+    name: String,
     jobs: Sender<Job>,
     waker: Option<Waker>,
     bytes: Arc<AtomicU64>,
@@ -167,6 +182,10 @@ impl UiReceiver {
 }
 
 impl net::Receiver for UiReceiver {
+    fn name(&self) -> String {
+        self.name.clone()
+    }
+
     fn decide(&self, offer: net::Offer) -> bool {
         let (reply, answer) = channel();
         self.post(Box::new(move |s: &mut App, _| {
@@ -347,6 +366,7 @@ impl App {
 
     fn start_network(&mut self) {
         let rx = Arc::new(UiReceiver {
+            name: self.name.clone(),
             jobs: self.jobs.0.clone(),
             waker: self.waker.clone(),
             bytes: self.received_bytes.clone(),
@@ -358,12 +378,84 @@ impl App {
                 return;
             }
         };
+        self.port = Some(port);
+        self.my_ips = net::local_ips();
+        for a in self.store.manual_peers.clone() {
+            if let Some(addr) = net::parse_addr(&a) {
+                self.check_peer(addr);
+            }
+        }
         let post = self.poster();
         match discovery::start(&self.store.device_id, &self.name, port, move |peers| {
-            post(Box::new(move |s: &mut App, _| s.peers = peers));
+            post(Box::new(move |s: &mut App, _| {
+                s.found = peers;
+                s.merge_peers();
+            }));
         }) {
             Ok(d) => self._mdns = Some(d),
             Err(e) => self.net_error = Some(format!("Can't look for other Macs: {e:#}")),
+        }
+    }
+
+    /// Discovered Macs, then ones added by hand that discovery didn't also find.
+    fn merge_peers(&mut self) {
+        let mut all = self.found.clone();
+        for a in &self.store.manual_peers {
+            let Some(addr) = net::parse_addr(a) else {
+                continue;
+            };
+            if all.iter().any(|p| p.addr == addr) {
+                continue;
+            }
+            let id = manual_id(&addr);
+            let name = match self.reach.get(&id) {
+                Some(Ok((name, _))) => name.clone(),
+                _ => addr.to_string(),
+            };
+            all.push(Peer { id, name, addr });
+        }
+        self.peers = all;
+    }
+
+    /// Pings a hand-added Mac to learn its name, or why it can't be reached.
+    fn check_peer(&mut self, addr: std::net::SocketAddr) {
+        let id = manual_id(&addr);
+        self.reach.remove(&id);
+        self.merge_peers();
+        self.bg(
+            move || net::ping(addr).map_err(|e| format!("{e:#}")),
+            move |s, res, _| {
+                s.reach.insert(id, res);
+                s.merge_peers();
+            },
+        );
+    }
+
+    fn connect(&mut self) {
+        let Some(edit) = &self.connect else { return };
+        let Some(addr) = net::parse_addr(&edit.text) else {
+            self.notify("Enter an address like 192.168.1.20", true);
+            return;
+        };
+        self.connect = None;
+        let key = addr.to_string();
+        if !self.store.manual_peers.contains(&key) {
+            self.store.manual_peers.push(key);
+            self.save();
+        }
+        self.check_peer(addr);
+        self.page = Page::Peer(manual_id(&addr));
+    }
+
+    fn forget_peer(&mut self, addr: std::net::SocketAddr) {
+        self.store
+            .manual_peers
+            .retain(|a| net::parse_addr(a) != Some(addr));
+        self.save();
+        self.reach.remove(&manual_id(&addr));
+        self.merge_peers();
+        if self.page == Page::Peer(manual_id(&addr)) {
+            self.page = Page::Inventory;
         }
     }
 
@@ -843,7 +935,7 @@ fn sidebar(s: &App, k: &Kit) -> El {
     } else if s.peers.is_empty() {
         rows.push(
             SidebarRow::new("Looking for other Macs…")
-                .subtitle("Open macpack on the other Mac")
+                .subtitle("Not found? Use Connect… with its address")
                 .height(44.0)
                 .select_only()
                 .build(k)
@@ -852,20 +944,58 @@ fn sidebar(s: &App, k: &Kit) -> El {
     }
     for p in &s.peers {
         let id = p.id.clone();
+        let manual = p.id.starts_with("addr:");
+        let subtitle = match s.reach.get(&p.id) {
+            _ if !manual => p.addr.ip().to_string(),
+            None => format!("{} · checking…", p.addr),
+            Some(Ok(_)) => format!("{} · added by hand", p.addr),
+            Some(Err(_)) => format!("{} · not answering", p.addr),
+        };
+        let mut r = SidebarRow::new(p.name.clone())
+            .subtitle(subtitle)
+            .height(44.0)
+            .selected(s.page == Page::Peer(p.id.clone()))
+            .on_select(move |s: &mut App, _| s.page = Page::Peer(id.clone()));
+        if manual {
+            let addr = p.addr;
+            r = r.on_close(move |s: &mut App, _| s.forget_peer(addr));
+        }
+        rows.push(r.build(k).key(format!("peer/{}", p.id)));
+    }
+    if let Some(port) = s.port {
+        let ips: Vec<String> = s.my_ips.iter().map(|ip| ip.to_string()).collect();
+        let me = match (ips.is_empty(), port == net::PORT) {
+            (true, _) => format!("This Mac listens on port {port}"),
+            (false, true) => format!("This Mac's address: {}", ips.join(", ")),
+            (false, false) => format!(
+                "This Mac's address: {}",
+                ips.iter()
+                    .map(|ip| format!("{ip}:{port}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        };
         rows.push(
-            SidebarRow::new(p.name.clone())
-                .subtitle(p.addr.ip().to_string())
-                .height(44.0)
-                .selected(s.page == Page::Peer(p.id.clone()))
-                .on_select(move |s: &mut App, _| s.page = Page::Peer(id.clone()))
-                .build(k)
-                .key(format!("peer/{}", p.id)),
+            text(me)
+                .font(k.ty.small)
+                .color(k.c.text_faint)
+                .wrap()
+                .px(10.0)
+                .py(4.0)
+                .key("my-addr"),
         );
     }
     sb = sb.section(
         SidebarSection::new("Nearby Macs")
             .key("peers")
             .count(s.peers.len())
+            .action(
+                Button::new("Connect…")
+                    .variant(ButtonVariant::GhostFaint)
+                    .control_size(ControlSize::Small)
+                    .on_press(|s: &mut App| s.connect = Some(TextEdit::new("")))
+                    .build(k),
+            )
             .rows(rows),
     );
     if !s.saved.is_empty() || s.receiving.is_some() {
@@ -914,6 +1044,10 @@ fn sidebar(s: &App, k: &Kit) -> El {
         );
     }
     sb.build(k)
+}
+
+fn manual_id(addr: &std::net::SocketAddr) -> String {
+    format!("addr:{addr}")
 }
 
 /// `2026-11-12`, from unix seconds (UTC; good enough to tell packages apart).
@@ -1193,6 +1327,30 @@ fn peer_page(s: &App, k: &Kit, id: &str) -> El {
         ));
     };
     let selected = s.selection();
+    if let Some(Err(e)) = s.reach.get(id) {
+        let addr = peer.addr;
+        return col()
+            .w_full()
+            .max_w(560.0)
+            .padding(24.0)
+            .gap(14.0)
+            .child(heading(k, peer.addr.to_string()))
+            .child(text(e.clone()).font(k.ty.ui).color(k.c.danger.fg).wrap())
+            .child(muted(
+                k,
+                "Check that macpack is open on that Mac and the address matches what it shows under Nearby Macs. \
+                 If it still doesn't answer, allow macpack in System Settings → Privacy & Security → Local Network, \
+                 and under Network → Firewall, on that Mac.",
+            ))
+            .child(
+                row().gap(8.0).child(
+                    Button::new("Check again")
+                        .variant(ButtonVariant::Contrast)
+                        .on_press(move |s: &mut App| s.check_peer(addr))
+                        .build(k),
+                ),
+            );
+    }
     let mut c = col()
         .w_full()
         .max_w(560.0)
@@ -1406,6 +1564,7 @@ fn modal(
         .on_close(|s: &mut App| {
             s.add_folder = None;
             s.save_set = None;
+            s.connect = None;
             s.confirm = None;
         })
         .build(k, layer);
@@ -1417,6 +1576,7 @@ fn cancel(k: &Kit) -> El {
         .on_press(|s: &mut App| {
             s.add_folder = None;
             s.save_set = None;
+            s.connect = None;
             s.confirm = None;
         })
         .build(k)
@@ -1481,6 +1641,30 @@ fn dialogs(s: &App, k: &Kit, layer: &mut Vec<El>) {
             .on_close(|s: &mut App| s.answer(false))
             .build(k, layer);
         return;
+    }
+    if let Some(edit) = &s.connect {
+        let input = TextInput::new(edit)
+            .placeholder("192.168.1.20")
+            .width(None)
+            .on_edit(|s: &mut App| s.connect.as_mut().expect("dialog open"))
+            .on_submit(|s: &mut App, _| s.connect())
+            .build(k);
+        let go = Button::new("Connect")
+            .variant(ButtonVariant::Contrast)
+            .on_press(|s: &mut App| s.connect())
+            .build(k);
+        modal(
+            "connect",
+            "Connect by address",
+            Some(
+                "For when the Macs don't find each other. The other Mac shows its address at the bottom of Nearby Macs.",
+            ),
+            vec![input],
+            vec![cancel(k), go],
+            k,
+            layer,
+            440.0,
+        );
     }
     if let Some(edit) = &s.save_set {
         let input = TextInput::new(edit)
@@ -1863,6 +2047,21 @@ fn main() {
                 "{}",
                 serde_json::to_string_pretty(&inv.items).unwrap_or_default()
             );
+            return;
+        }
+        // `macpack ping 192.168.1.20`: checks that macpack answers at an address.
+        Some("ping") => {
+            let Some(addr) = args.get(2).and_then(|a| net::parse_addr(a)) else {
+                eprintln!("usage: macpack ping <address>[:port]");
+                std::process::exit(2);
+            };
+            match net::ping(addr) {
+                Ok((name, version)) => println!("{name} answered at {addr} (macpack {version})"),
+                Err(e) => {
+                    eprintln!("macpack: {e:#}");
+                    std::process::exit(1);
+                }
+            }
             return;
         }
         Some("--version" | "-V") => {

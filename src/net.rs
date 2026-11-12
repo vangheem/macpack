@@ -43,11 +43,24 @@ const KIND_END: u8 = 2;
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum Msg {
-    Offer { from: String, manifest: Manifest },
+    Offer {
+        from: String,
+        manifest: Manifest,
+    },
     Accept,
     Decline,
     Received,
+    /// Asks who's there, without involving the user: for checking an address typed by hand.
+    Ping,
+    Pong {
+        name: String,
+        version: String,
+    },
 }
+
+/// The port macpack listens on, so an address can be typed by hand when discovery fails.
+/// Another program holding it makes macpack fall back to a random port.
+pub const PORT: u16 = 47_321;
 
 pub struct Channel {
     stream: TcpStream,
@@ -253,6 +266,60 @@ pub fn send(
     }
 }
 
+/// Checks that macpack answers at `addr`, returning its name and version.
+pub fn ping(addr: SocketAddr) -> Result<(String, String)> {
+    let stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5))
+        .with_context(|| format!("nothing answered at {addr}"))?;
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    let mut ch = Channel::initiate(stream).context("that isn't macpack")?;
+    ch.send_msg(&Msg::Ping)?;
+    match ch.recv_msg()? {
+        Msg::Pong { name, version } => Ok((name, version)),
+        m => bail!("unexpected reply {m:?}"),
+    }
+}
+
+/// `192.168.1.20`, `192.168.1.20:47321` or `macbook.local` → a socket address, using
+/// macpack's port when none is given.
+pub fn parse_addr(input: &str) -> Option<SocketAddr> {
+    use std::net::ToSocketAddrs;
+    let s = input.trim();
+    if s.is_empty() {
+        return None;
+    }
+    if let Ok(a) = s.parse::<SocketAddr>() {
+        return Some(a);
+    }
+    if let Ok(ip) = s.parse::<std::net::IpAddr>() {
+        return Some(SocketAddr::new(ip, PORT));
+    }
+    let with_port = if s.contains(':') {
+        s.to_string()
+    } else {
+        format!("{s}:{PORT}")
+    };
+    with_port.to_socket_addrs().ok()?.find(|a| a.is_ipv4())
+}
+
+/// This Mac's LAN addresses, to show so the other Mac can type one in.
+pub fn local_ips() -> Vec<std::net::Ipv4Addr> {
+    let mut out = Vec::new();
+    for ifc in ["en0", "en1", "en2", "en3", "en4", "en5", "en6"] {
+        let Ok(o) = std::process::Command::new("/usr/sbin/ipconfig")
+            .args(["getifaddr", ifc])
+            .output()
+        else {
+            continue;
+        };
+        if let Ok(ip) = String::from_utf8_lossy(&o.stdout).trim().parse()
+            && !out.contains(&ip)
+        {
+            out.push(ip);
+        }
+    }
+    out
+}
+
 /// An incoming offer, waiting for the user.
 pub struct Offer {
     pub from: String,
@@ -306,11 +373,15 @@ pub trait Receiver: Send + Sync + 'static {
     fn decide(&self, offer: Offer) -> bool;
     fn progress(&self, bytes: u64);
     fn done(&self, result: Result<Saved>);
+    /// This Mac's name, for answering pings.
+    fn name(&self) -> String;
 }
 
 /// Listens on a free port in the background, returning it.
 pub fn listen(rx: std::sync::Arc<dyn Receiver>) -> Result<u16> {
-    let listener = TcpListener::bind(("0.0.0.0", 0)).context("listen")?;
+    let listener = TcpListener::bind(("0.0.0.0", PORT))
+        .or_else(|_| TcpListener::bind(("0.0.0.0", 0)))
+        .context("listen")?;
     let port = listener.local_addr()?.port();
     std::thread::spawn(move || {
         for stream in listener.incoming().flatten() {
@@ -328,8 +399,16 @@ pub fn listen(rx: std::sync::Arc<dyn Receiver>) -> Result<u16> {
 fn receive(stream: TcpStream, rx: &dyn Receiver) -> Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(30)))?;
     let mut ch = Channel::respond(stream)?;
-    let Msg::Offer { from, manifest } = ch.recv_msg()? else {
-        bail!("expected an offer");
+    let (from, manifest) = match ch.recv_msg()? {
+        Msg::Offer { from, manifest } => (from, manifest),
+        Msg::Ping => {
+            ch.send_msg(&Msg::Pong {
+                name: rx.name(),
+                version: env!("CARGO_PKG_VERSION").into(),
+            })?;
+            return Ok(());
+        }
+        _ => bail!("expected an offer"),
     };
     if manifest.format > package::FORMAT {
         ch.send_msg(&Msg::Decline)?;
@@ -423,6 +502,9 @@ mod tests {
             offer.from == "laptop"
         }
         fn progress(&self, _: u64) {}
+        fn name(&self) -> String {
+            "desk".into()
+        }
         fn done(&self, r: Result<Saved>) {
             let code = self.1.lock().unwrap().clone();
             if let Some(tx) = self.0.lock().unwrap().as_ref() {
@@ -457,6 +539,8 @@ mod tests {
                 sensitive: false,
             }],
         );
+        let addr: SocketAddr = ([127, 0, 0, 1], port).into();
+        assert_eq!(ping(addr).unwrap().0, "desk");
         let sender_code = Mutex::new(String::new());
         let ok = send(
             ([127, 0, 0, 1], port).into(),

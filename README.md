@@ -41,7 +41,9 @@ credentials (`~/.ssh`, `~/.aws`, `~/.config/gh`…) are flagged.
 
 1. Install and open macpack on both Macs, on the same network.
 2. On the old Mac, check what to bring under **This Mac**. Your choices are remembered.
-3. Pick the new Mac under **Nearby Macs** and click **Send**.
+3. Pick the new Mac under **Nearby Macs** and click **Send**. If it doesn't show up, click
+   **Connect…** and type the address the new Mac shows at the bottom of Nearby Macs
+   (macpack listens on port 47321). `macpack ping <address>` checks it from a terminal.
 4. Both Macs show a 6-digit code. If they match, click **Codes match, accept** on the new Mac.
 5. The package arrives under **Received**. Untick anything you don't want, then
    **Apply to this Mac**.

@@ -31,6 +31,9 @@ pub struct Store {
     /// A release the user chose to skip ("v0.4.0").
     #[serde(default)]
     pub skipped_version: Option<String>,
+    /// Addresses of Macs added by hand (`192.168.1.20:47321`), for when discovery fails.
+    #[serde(default)]
+    pub manual_peers: Vec<String>,
 }
 
 /// What's ticked: folders added, and items turned on or off against their defaults.
