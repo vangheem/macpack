@@ -59,7 +59,6 @@ enum Confirm {
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Phase {
-    Packing,
     Connecting,
     /// Waiting for the other Mac to compare codes and accept.
     Code,
@@ -99,14 +98,18 @@ struct Transfer {
     /// The receiver's transfer id.
     id: Option<String>,
     phase: Phase,
-    /// The furthest step reached, for the step list.
-    step: usize,
     code: Option<String>,
+    /// The other Mac accepted.
+    accepted: bool,
+    /// Packing finished; `size` is then the package's final size.
+    pack_done: bool,
     size: u64,
-    /// Bytes packed (while packing) or moved so far.
+    /// Compressed bytes packed so far (the sender's, reported to the receiver too).
+    packed: Arc<AtomicU64>,
+    /// Bytes delivered so far.
     bytes: Arc<AtomicU64>,
     attempt: u32,
-    /// Where the current attempt picked up.
+    /// Where the current attempt picked up, when it resumed.
     resumed_at: u64,
     packing: Option<(String, usize, usize)>,
     retry_at: Option<f64>,
@@ -128,13 +131,15 @@ impl Transfer {
             peer,
             id: None,
             phase: if outgoing {
-                Phase::Packing
+                Phase::Connecting
             } else {
                 Phase::Transferring
             },
-            step: 0,
             code: None,
+            accepted: !outgoing,
+            pack_done: false,
             size: 0,
+            packed: Arc::new(AtomicU64::new(0)),
             bytes: Arc::new(AtomicU64::new(0)),
             attempt: 0,
             resumed_at: 0,
@@ -154,9 +159,8 @@ impl Transfer {
         self.log.push((now - self.started, msg.into(), tone));
     }
 
-    fn set(&mut self, phase: Phase, step: usize) {
+    fn set(&mut self, phase: Phase) {
         self.phase = phase;
-        self.step = self.step.max(step);
         self.samples.clear();
     }
 
@@ -169,7 +173,6 @@ impl Transfer {
 
 struct Incoming {
     id: String,
-    size: u64,
     from: String,
     code: String,
     manifest: Manifest,
@@ -301,7 +304,6 @@ impl net::Receiver for UiReceiver {
             }
             s.incoming = Some(Incoming {
                 id: offer.id,
-                size: offer.size,
                 from: offer.from,
                 code: offer.code,
                 manifest: offer.manifest,
@@ -666,20 +668,29 @@ impl App {
             format!("Sending to {} at {}", peer.name, peer.addr),
             Tone::Info,
         );
-        let (cancel, retry_now, bytes) = (t.cancel.clone(), t.retry_now.clone(), t.bytes.clone());
+        let (cancel, retry_now) = (t.cancel.clone(), t.retry_now.clone());
+        let (bytes, packed) = (t.bytes.clone(), t.packed.clone());
         self.transfer = Some(t);
         let (addr, from) = (peer.addr, self.name.clone());
         let manifest = Manifest::new(from.clone(), items);
         let post = self.poster();
         self.bg(
             move || {
+                // Packing runs alongside connecting and sending: each part goes out as soon
+                // as it's packed.
+                let post2 = post.clone();
+                let mut out = net::Outgoing::start(
+                    from,
+                    manifest,
+                    Arc::new(move |ev| match ev {
+                        net::SendEvent::Packed(n) => packed.store(n, Ordering::Relaxed),
+                        ev => post2(Box::new(move |s: &mut App, _| s.on_send(ev))),
+                    }),
+                )?;
                 let on = |ev: net::SendEvent| match ev {
-                    net::SendEvent::Packed(n) | net::SendEvent::Progress(n) => {
-                        bytes.store(n, Ordering::Relaxed)
-                    }
+                    net::SendEvent::Progress(n) => bytes.store(n, Ordering::Relaxed),
                     ev => post(Box::new(move |s: &mut App, _| s.on_send(ev))),
                 };
-                let mut out = net::pack(from, manifest, &on)?;
                 net::send(addr, &mut out, &cancel, &retry_now, &on)
             },
             |s, res, _| {
@@ -687,16 +698,16 @@ impl App {
                 let Some(t) = &mut s.transfer else { return };
                 match res {
                     Ok(true) => {
-                        t.set(Phase::Done, 5);
+                        t.set(Phase::Done);
                         t.log(now, "Delivered and checked on the other Mac", Tone::Good);
                     }
-                    Ok(false) => t.set(Phase::Declined, t.step),
+                    Ok(false) => t.set(Phase::Declined),
                     Err(_) if t.cancel.load(Ordering::Relaxed) => {
-                        t.set(Phase::Cancelled, t.step);
+                        t.set(Phase::Cancelled);
                         t.log(now, "Cancelled", Tone::Bad);
                     }
                     Err(e) => {
-                        t.set(Phase::Failed, t.step);
+                        t.set(Phase::Failed);
                         t.last_error = Some(format!("{e:#}"));
                         t.log(now, format!("Failed: {e:#}"), Tone::Bad);
                     }
@@ -719,13 +730,14 @@ impl App {
             }
             E::PackDone { size } => {
                 t.size = size;
+                t.pack_done = true;
                 t.packing = None;
                 t.log(now, format!("Packed {}", human_size(size)), Tone::Info);
             }
             E::Connecting { attempt } => {
                 t.attempt = attempt;
                 t.retry_at = None;
-                t.set(Phase::Connecting, 1);
+                t.set(Phase::Connecting);
                 t.log(
                     now,
                     if attempt == 1 {
@@ -738,37 +750,45 @@ impl App {
             }
             E::Code(code) => {
                 t.code = Some(code.clone());
-                t.set(Phase::Code, 2);
+                t.set(Phase::Code);
                 t.log(
                     now,
                     format!("Waiting for the other Mac to accept code {code}"),
                     Tone::Info,
                 );
             }
-            E::Sending { offset, resumed } => {
-                t.resumed_at = offset;
-                t.bytes.store(offset, Ordering::Relaxed);
-                t.set(Phase::Transferring, 3);
+            E::Accepted { resumed } => {
+                t.accepted = true;
+                t.set(Phase::Transferring);
                 t.log(
                     now,
                     if resumed {
-                        format!("Resuming at {}", human_size(offset))
+                        "Reconnected"
                     } else {
-                        "Accepted; sending".to_string()
+                        "The other Mac accepted; sending parts as they're packed"
                     },
                     Tone::Good,
                 );
             }
+            E::Resumed(at) => {
+                t.resumed_at = at;
+                t.bytes.store(at, Ordering::Relaxed);
+                t.log(now, format!("Resuming at {}", human_size(at)), Tone::Good);
+            }
             E::Verifying => {
-                t.set(Phase::Verifying, 4);
-                t.log(now, "All sent; the other Mac is checking it", Tone::Info);
+                t.set(Phase::Verifying);
+                t.log(
+                    now,
+                    "All parts delivered; the other Mac is filing it",
+                    Tone::Info,
+                );
             }
             E::Retrying {
                 attempt,
                 error,
                 wait,
             } => {
-                t.set(Phase::Retrying, t.step);
+                t.set(Phase::Retrying);
                 t.retry_at = Some(now + wait as f64);
                 t.log(now, format!("Attempt {attempt} failed: {error}"), Tone::Bad);
                 t.last_error = Some(error);
@@ -782,9 +802,10 @@ impl App {
         let now = self.now;
         use net::RecvEvent as E;
         let id = match &ev {
-            E::Started { id, .. }
+            E::Connected { id, .. }
+            | E::Packing { id, .. }
             | E::Progress { id, .. }
-            | E::Verifying { id }
+            | E::Finishing { id, .. }
             | E::Interrupted { id, .. }
             | E::Corrupt { id }
             | E::Done { id, .. } => id.clone(),
@@ -795,59 +816,75 @@ impl App {
             .as_ref()
             .is_some_and(|t| t.id.as_deref() == Some(&id));
         if !ours {
-            let E::Started { from, .. } = &ev else { return };
+            let E::Connected { from, .. } = &ev else {
+                return;
+            };
             if self.transfer.as_ref().is_some_and(|t| !t.phase.finished()) {
                 return;
             }
             let mut t = Transfer::new(false, from.clone(), now);
             t.bytes = self.received_bytes.clone();
             t.id = Some(id.clone());
-            t.step = 1;
             self.transfer = Some(t);
         }
         let Some(t) = &mut self.transfer else { return };
         match ev {
-            E::Started {
-                size,
-                offset,
+            E::Connected {
                 resumed,
                 from,
+                have,
                 ..
             } => {
-                t.size = size;
-                t.resumed_at = offset;
                 t.attempt += 1;
-                t.bytes.store(offset, Ordering::Relaxed);
-                t.set(Phase::Transferring, 1);
+                t.set(Phase::Transferring);
+                t.bytes.store(have, Ordering::Relaxed);
+                if resumed {
+                    t.resumed_at = have;
+                    t.log(
+                        now,
+                        format!("{from} reconnected; resuming at {}", human_size(have)),
+                        Tone::Good,
+                    );
+                } else {
+                    t.log(now, format!("Connected to {from}"), Tone::Good);
+                }
+            }
+            E::Packing {
+                label,
+                index,
+                total,
+                packed,
+                ..
+            } => {
+                t.packed.store(packed, Ordering::Relaxed);
+                t.packing = Some((label, index, total));
+            }
+            E::Finishing { size, .. } => {
+                t.size = size;
+                t.pack_done = true;
+                t.packing = None;
+                t.packed.store(size, Ordering::Relaxed);
+                t.set(Phase::Verifying);
                 t.log(
                     now,
-                    if resumed {
-                        format!("{from} reconnected; resuming at {}", human_size(offset))
-                    } else {
-                        format!("Receiving {} from {from}", human_size(size))
-                    },
-                    Tone::Good,
+                    format!("All {} arrived; filing it", human_size(size)),
+                    Tone::Info,
                 );
             }
-            E::Verifying { .. } => {
-                t.set(Phase::Verifying, 2);
-                t.log(now, "Everything arrived; checking it", Tone::Info);
-            }
             E::Interrupted { error, .. } => {
-                t.set(Phase::Interrupted, t.step);
+                t.set(Phase::Interrupted);
                 t.log(now, format!("Connection lost: {error}"), Tone::Bad);
                 t.last_error = Some(error);
             }
             E::Corrupt { .. } => {
-                t.set(Phase::Interrupted, 1);
                 t.log(
                     now,
-                    "The package arrived damaged; it's being sent again",
+                    "A part arrived damaged; it's being sent again",
                     Tone::Bad,
                 );
             }
             E::Done { saved, .. } => {
-                t.set(Phase::Done, 4);
+                t.set(Phase::Done);
                 t.saved = Some(saved.id.clone());
                 t.log(now, "Checked and saved", Tone::Good);
                 self.saved.retain(|p| p.id != saved.id);
@@ -885,8 +922,7 @@ impl App {
             let mut t = Transfer::new(false, inc.from.clone(), self.now);
             t.bytes = self.received_bytes.clone();
             t.id = Some(inc.id.clone());
-            t.size = inc.size;
-            t.step = 1;
+
             t.log(self.now, format!("Accepted code {}", inc.code), Tone::Good);
             self.transfer = Some(t);
         }
@@ -1694,22 +1730,29 @@ fn progress_bar(k: &Kit, frac: f64) -> El {
         .child(el().h_full().grow((1.0 - frac).max(0.0001)))
 }
 
-/// The whole window while a transfer runs: steps, code, progress, retries and a log.
+/// The whole window while a transfer runs: steps, code, packing and sending progress,
+/// retries and a log.
 fn transfer_screen(s: &App, k: &Kit, t: &Transfer) -> El {
     let bytes = t.bytes.load(Ordering::Relaxed);
+    let packed = if t.pack_done {
+        t.size
+    } else {
+        t.packed.load(Ordering::Relaxed).max(bytes)
+    };
     let title = if t.outgoing {
         format!("Sending to {}", t.peer)
     } else {
         format!("Receiving from {}", t.peer)
     };
     let status = match t.phase {
-        Phase::Packing => "Packing your files".to_string(),
         Phase::Connecting => format!("Connecting to {}", t.peer),
-        Phase::Code => "Check that the other Mac shows this code, and accept there".into(),
+        Phase::Code => "Check that the other Mac shows this code, and accept there. Packing has already started".into(),
+        Phase::Transferring if t.outgoing && !t.pack_done => "Packing and sending at the same time".into(),
         Phase::Transferring if t.outgoing => "Sending".into(),
+        Phase::Transferring if !t.pack_done => format!("Receiving parts as {} packs them", t.peer),
         Phase::Transferring => "Receiving".into(),
-        Phase::Verifying if t.outgoing => "The other Mac is checking the package".into(),
-        Phase::Verifying => "Checking the package".into(),
+        Phase::Verifying if t.outgoing => "The other Mac is filing the package".into(),
+        Phase::Verifying => "Filing the package".into(),
         Phase::Retrying => "Connection problem; retrying automatically".into(),
         Phase::Interrupted => format!(
             "Connection lost. Waiting for {} to reconnect; it picks up where it stopped",
@@ -1721,29 +1764,58 @@ fn transfer_screen(s: &App, k: &Kit, t: &Transfer) -> El {
         Phase::Declined => "The other Mac declined".into(),
         Phase::Cancelled => "Cancelled".into(),
     };
-    let steps: &[&str] = if t.outgoing {
-        &[
-            "Pack files",
-            "Connect",
-            "Confirm the code",
-            "Send",
-            "Check on the other Mac",
+    let done_all = t.phase == Phase::Done;
+    let active = !t.phase.finished();
+    let moving = matches!(t.phase, Phase::Transferring);
+    // (name, done, running)
+    let steps: Vec<(&str, bool, bool)> = if t.outgoing {
+        vec![
+            (
+                "Connect",
+                t.code.is_some() || t.accepted,
+                t.phase == Phase::Connecting && t.code.is_none(),
+            ),
+            ("Confirm the code", t.accepted, t.phase == Phase::Code),
+            ("Pack files", t.pack_done, !t.pack_done && active),
+            (
+                "Send each part as it's packed",
+                done_all || t.phase == Phase::Verifying,
+                moving,
+            ),
+            (
+                "Filed on the other Mac",
+                done_all,
+                t.phase == Phase::Verifying,
+            ),
         ]
     } else {
-        &["Accept", "Receive", "Check the package", "Save"]
+        vec![
+            ("Accept", true, false),
+            (
+                "Receive each part as it's packed",
+                done_all || t.phase == Phase::Verifying,
+                moving,
+            ),
+            (
+                "Check and file the package",
+                done_all,
+                t.phase == Phase::Verifying,
+            ),
+        ]
     };
+    let stuck = matches!(t.phase, Phase::Retrying | Phase::Interrupted);
     let bad = matches!(t.phase, Phase::Failed | Phase::Declined | Phase::Cancelled);
+    let first_open = steps.iter().position(|st| !st.1);
     let mut step_list = col().gap(6.0);
-    for (i, name) in steps.iter().enumerate() {
-        let done = i < t.step || t.phase == Phase::Done;
-        let current = i == t.step && !t.phase.finished();
+    for (i, (name, done, running)) in steps.iter().enumerate() {
+        let (done, running) = (*done, *running && active);
         let mark: El = if done {
             text("✓").font(k.ty.ui).color(k.c.success.fg).w(18.0)
-        } else if current && matches!(t.phase, Phase::Retrying | Phase::Interrupted) {
+        } else if stuck && first_open == Some(i) {
             text("!").font(k.ty.ui_medium).color(k.c.warning.fg).w(18.0)
-        } else if current {
+        } else if running {
             Spinner::new().build(k).w(18.0)
-        } else if i == t.step && bad {
+        } else if bad && first_open == Some(i) {
             text("✗").font(k.ty.ui).color(k.c.danger.fg).w(18.0)
         } else {
             text("·").font(k.ty.ui).color(k.c.text_faint).w(18.0)
@@ -1756,11 +1828,13 @@ fn transfer_screen(s: &App, k: &Kit, t: &Transfer) -> El {
                 .child(
                     text(name.to_string())
                         .font(k.ty.ui)
-                        .color(if done || current {
+                        .color(if done || running {
                             k.c.text_base
                         } else {
                             k.c.text_faint
-                        }),
+                        })
+                        .wrap()
+                        .shrink(),
                 )
                 .key(format!("step{i}")),
         );
@@ -1787,47 +1861,52 @@ fn transfer_screen(s: &App, k: &Kit, t: &Transfer) -> El {
                 .child(text(code.clone()).font(big_code(k)).color(k.c.text_base)),
         ));
     }
-    if t.phase == Phase::Packing {
-        let what = match &t.packing {
-            Some((label, i, n)) => format!("{label} ({i} of {n})"),
-            None => "Preparing".into(),
+
+    // Packing, then delivery: two bars, since both run at once.
+    let mut prog = col().gap(12.0);
+    let pack_line = if t.pack_done {
+        format!("Packed {}", human_size(t.size))
+    } else {
+        match &t.packing {
+            Some((label, i, n)) => format!(
+                "Packing {label} ({i} of {n}) · {} so far",
+                human_size(packed)
+            ),
+            None => format!("Packing · {} so far", human_size(packed)),
+        }
+    };
+    prog = prog.child(
+        col()
+            .gap(6.0)
+            .child(muted(k, pack_line))
+            .child(progress_bar(
+                k,
+                match (&t.packing, t.pack_done) {
+                    (_, true) => 1.0,
+                    (Some((_, i, n)), _) if *n > 0 => (*i as f64 - 1.0).max(0.0) / *n as f64,
+                    _ => 0.0,
+                },
+            )),
+    );
+    if t.accepted {
+        let frac = if packed > 0 {
+            bytes as f64 / packed as f64
+        } else {
+            0.0
         };
-        body = body.child(card(
-            col()
-                .child(heading(k, what))
-                .child(muted(k, format!("{} packed", human_size(bytes)))),
-        ));
-    }
-    let show_progress = t.size > 0
-        && matches!(
-            t.phase,
-            Phase::Transferring
-                | Phase::Verifying
-                | Phase::Retrying
-                | Phase::Interrupted
-                | Phase::Done
-        );
-    if show_progress {
-        let frac = bytes as f64 / t.size as f64;
-        let mut lines = col()
-            .gap(8.0)
-            .child(
-                row()
-                    .w_full()
-                    .child(heading(
-                        k,
-                        format!("{} of {}", human_size(bytes), human_size(t.size)),
-                    ))
-                    .child(row().grow(1.0))
-                    .child(heading(k, format!("{:.0}%", frac * 100.0))),
+        let total = if t.pack_done {
+            format!("{} of {}", human_size(bytes), human_size(t.size))
+        } else {
+            format!(
+                "{} of {} packed so far",
+                human_size(bytes),
+                human_size(packed)
             )
-            .child(progress_bar(k, frac));
+        };
         let mut facts = Vec::new();
-        if t.phase == Phase::Transferring
-            && let Some(rate) = t.rate()
-        {
+        if moving && let Some(rate) = t.rate() {
             facts.push(format!("{}/s", human_size(rate as u64)));
-            if rate > 1.0 {
+            if t.pack_done && rate > 1.0 {
                 facts.push(format!(
                     "about {} left",
                     clock(t.size.saturating_sub(bytes) as f64 / rate)
@@ -1840,11 +1919,33 @@ fn transfer_screen(s: &App, k: &Kit, t: &Transfer) -> El {
         if t.resumed_at > 0 {
             facts.push(format!("resumed at {}", human_size(t.resumed_at)));
         }
+        let mut c = col()
+            .gap(6.0)
+            .child(
+                row()
+                    .w_full()
+                    .child(heading(k, total))
+                    .child(row().grow(1.0))
+                    .child(heading(
+                        k,
+                        if t.pack_done {
+                            format!("{:.0}%", frac * 100.0)
+                        } else {
+                            String::new()
+                        },
+                    )),
+            )
+            .child(progress_bar(k, frac));
         if !facts.is_empty() {
-            lines = lines.child(muted(k, facts.join(" · ")));
+            c = c.child(muted(k, facts.join(" · ")));
         }
-        body = body.child(card(lines));
+        prog = prog.child(c);
     }
+    // The receiver doesn't pack; it only sees the sender's packing through status updates.
+    if t.outgoing || t.accepted {
+        body = body.child(card(prog));
+    }
+
     if matches!(
         t.phase,
         Phase::Retrying | Phase::Interrupted | Phase::Failed
@@ -1880,16 +1981,11 @@ fn transfer_screen(s: &App, k: &Kit, t: &Transfer) -> El {
                     ),
             );
         }
-        if matches!(
-            t.phase,
-            Phase::Retrying | Phase::Failed | Phase::Interrupted
-        ) {
-            c = c.child(muted(
-                k,
-                "Keep both Macs awake and on the same network, with macpack open. \
-                 If it keeps failing, check System Settings → Privacy & Security → Local Network and Network → Firewall.",
-            ));
-        }
+        c = c.child(muted(
+            k,
+            "Keep both Macs awake and on the same network, with macpack open. \
+             If it keeps failing, check System Settings → Privacy & Security → Local Network and Network → Firewall.",
+        ));
         body = body.child(card(c));
     }
 
@@ -2684,12 +2780,14 @@ fn main() {
             ("send", |s: &mut App| {
                 demo(s);
                 let mut t = Transfer::new(true, "Jane's Mac Studio".into(), 0.0);
-                t.size = 812_000_000;
+                t.packed.store(512_000_000, Ordering::Relaxed);
                 t.bytes.store(301_000_000, Ordering::Relaxed);
+                t.packing = Some(("~/projects".into(), 6, 7));
                 t.attempt = 2;
                 t.resumed_at = 214_000_000;
                 t.code = Some("482 913".into());
-                t.set(Phase::Transferring, 3);
+                t.accepted = true;
+                t.set(Phase::Transferring);
                 t.samples = [(10.0, 250_000_000), (14.0, 301_000_000)]
                     .into_iter()
                     .collect();
@@ -2699,14 +2797,17 @@ fn main() {
                         "Sending to Jane's Mac Studio at 192.168.1.24:47321".into(),
                         Tone::Info,
                     ),
-                    (6.2, "Packed 774.4 MB".into(), Tone::Info),
-                    (6.3, "Connecting".into(), Tone::Info),
+                    (0.1, "Connecting".into(), Tone::Info),
                     (
-                        6.4,
+                        0.2,
                         "Waiting for the other Mac to accept code 482 913".into(),
                         Tone::Info,
                     ),
-                    (11.0, "Accepted; sending".into(), Tone::Good),
+                    (
+                        5.0,
+                        "The other Mac accepted; sending parts as they're packed".into(),
+                        Tone::Good,
+                    ),
                     (
                         42.5,
                         "Attempt 1 failed: the connection dropped (Connection reset by peer)"
@@ -2714,6 +2815,7 @@ fn main() {
                         Tone::Bad,
                     ),
                     (44.5, "Reconnecting (attempt 2)".into(), Tone::Info),
+                    (44.6, "Reconnected".into(), Tone::Good),
                     (44.6, "Resuming at 204.1 MB".into(), Tone::Good),
                 ];
                 s.now = 60.0;
@@ -2722,42 +2824,36 @@ fn main() {
             ("send-retry", |s: &mut App| {
                 demo(s);
                 let mut t = Transfer::new(true, "Jane's Mac Studio".into(), 0.0);
+                t.pack_done = true;
                 t.size = 812_000_000;
                 t.bytes.store(301_000_000, Ordering::Relaxed);
                 t.attempt = 3;
-                t.set(Phase::Transferring, 3);
-                t.set(Phase::Retrying, 3);
-                t.retry_at = Some(68.0);
+                t.accepted = true;
+                t.set(Phase::Retrying);
+                t.retry_at = Some(8.0);
                 t.last_error = Some("the other Mac isn't reachable (No route to host)".into());
                 t.log = vec![(
                     55.0,
                     "Attempt 3 failed: the other Mac isn't reachable (No route to host)".into(),
                     Tone::Bad,
                 )];
-                s.now = 60.0;
                 s.transfer = Some(t);
             }),
             ("receive", |s: &mut App| {
                 demo(s);
                 let mut t = Transfer::new(false, "Jane's old MacBook Air".into(), 0.0);
-                t.size = 812_000_000;
-                t.bytes.store(640_000_000, Ordering::Relaxed);
-                t.set(Phase::Interrupted, 1);
-                t.last_error = Some("the connection stalled".into());
+                t.packed.store(420_000_000, Ordering::Relaxed);
+                t.bytes.store(380_000_000, Ordering::Relaxed);
+                t.packing = Some(("~/projects".into(), 6, 7));
+                t.set(Phase::Transferring);
                 t.log = vec![
                     (0.0, "Accepted code 482 913".into(), Tone::Good),
                     (
                         0.4,
-                        "Receiving 774.4 MB from Jane's old MacBook Air".into(),
+                        "Connected to Jane's old MacBook Air".into(),
                         Tone::Good,
                     ),
-                    (
-                        51.0,
-                        "Connection lost: the connection stalled".into(),
-                        Tone::Bad,
-                    ),
                 ];
-                s.now = 60.0;
                 s.transfer = Some(t);
             }),
             ("scanning", |s: &mut App| {
@@ -2782,7 +2878,6 @@ fn main() {
                 let (reply, _) = channel();
                 s.incoming = Some(Incoming {
                     id: "x".into(),
-                    size: 812_000_000,
                     from: "Jane's old MacBook Air".into(),
                     code: "482 913".into(),
                     manifest: s.saved[0].manifest.clone(),

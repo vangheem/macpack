@@ -17,10 +17,12 @@
 //! mix it into the keys, so they need no new code and can't be taken over by anyone who wasn't
 //! part of the original, verified exchange.
 //!
-//! The sender packs everything into a file first, so a transfer can pick up at any byte
-//! offset. The receiver appends to `inbox/<id>.part`, checks the size and SHA-256 at the end,
-//! and only then files the package. A dropped connection or a stalled one is retried with
-//! backoff and resumes where it stopped.
+//! The package is one gzipped tar stream, cut into parts of about 16 MB as it's packed. Each
+//! finished part is sent (and checked against its SHA-256) while the next one is still being
+//! packed, so packing and sending overlap. The receiver appends verified parts to
+//! `inbox/<id>.part` and files the package once the last one arrives. A dropped or stalled
+//! connection is retried with backoff and resumes at the byte where it stopped, within the
+//! part it was on.
 //!
 //! After the handshake every message is a frame: a big-endian `u32` length, then ciphertext
 //! whose first plaintext byte says what it is (JSON control message, file data, or end).
@@ -62,27 +64,46 @@ pub const PORT: u16 = 47_321;
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum Msg {
-    /// A new transfer, on a channel the receiver hasn't verified yet.
+    /// A new transfer, on a channel the receiver hasn't verified yet. Sent before packing
+    /// starts producing anything, so the other Mac can accept straight away.
     Offer {
         id: String,
         from: String,
-        size: u64,
-        sha256: String,
         manifest: Manifest,
     },
     /// Continue transfer `id`, on a channel keyed with its resume secret.
     Resume {
         id: String,
     },
-    /// Send from this byte on.
+    /// Accepted (an offer or a resume), or: send part data from this byte of the part.
     Accept {
         offset: u64,
     },
     Decline {
         reason: String,
     },
+    /// The sender is packing; this is how far it got.
+    Status {
+        label: String,
+        index: usize,
+        total: usize,
+        packed: u64,
+    },
+    /// Part `index` is next: this big, with this hash.
+    Part {
+        index: usize,
+        size: u64,
+        sha256: String,
+    },
+    /// The part arrived and checked out.
+    PartOk,
+    /// That was all of it: `parts` parts, `size` bytes.
+    Finish {
+        parts: usize,
+        size: u64,
+    },
     Received,
-    /// The finished file didn't check out; the receiver threw it away.
+    /// A part didn't check out; the receiver threw it away.
     Corrupt,
     /// Asks who's there, without involving the user.
     Ping,
@@ -91,6 +112,9 @@ enum Msg {
         version: String,
     },
 }
+
+/// Parts are cut once they pass this size.
+const PART_SIZE: u64 = 16 << 20;
 
 pub type TransferId = [u8; 16];
 
@@ -343,7 +367,7 @@ pub enum SendEvent {
     },
     /// Compressed bytes packed so far.
     Packed(u64),
-    /// Ready: the package is this big.
+    /// Packing finished: the package is this big.
     PackDone {
         size: u64,
     },
@@ -352,13 +376,15 @@ pub enum SendEvent {
     },
     /// Connected to a Mac that hasn't accepted yet: show this code.
     Code(String),
-    /// Sending from `offset` (non-zero when resuming).
-    Sending {
-        offset: u64,
+    /// The other Mac accepted (or recognised a reconnect).
+    Accepted {
         resumed: bool,
     },
+    /// Picked up where an earlier attempt stopped, this many bytes in.
+    Resumed(u64),
+    /// Bytes delivered and checked so far, plus the part in flight.
     Progress(u64),
-    /// Everything sent; the other Mac is checking it.
+    /// All parts delivered; the other Mac is filing the package.
     Verifying,
     /// `error` happened; trying again in `wait` seconds.
     Retrying {
@@ -369,72 +395,194 @@ pub enum SendEvent {
     Note(String),
 }
 
-/// A package packed and ready to send, with what's needed to resume it.
+/// A finished part waiting to be sent.
+#[derive(Clone)]
+struct PartFile {
+    path: PathBuf,
+    size: u64,
+    sha256: String,
+}
+
+/// Packing progress, shared between the packing thread and the connection.
+#[derive(Default)]
+struct PackState {
+    label: String,
+    index: usize,
+    total: usize,
+    packed: u64,
+    parts: Vec<PartFile>,
+    /// Number of parts once packing finished, or why it failed.
+    done: Option<std::result::Result<usize, String>>,
+}
+
+/// Writes a stream into numbered part files, hashing each, and publishes every part as it's
+/// cut so it can be sent while the rest is still being written.
+struct PartWriter {
+    dir: PathBuf,
+    state: std::sync::Arc<std::sync::Mutex<PackState>>,
+    file: Option<std::io::BufWriter<std::fs::File>>,
+    hash: Sha256,
+    size: u64,
+    index: usize,
+}
+
+impl PartWriter {
+    fn path(&self, i: usize) -> PathBuf {
+        self.dir.join(format!("{i:05}.part"))
+    }
+
+    fn close(&mut self) -> std::io::Result<()> {
+        let Some(mut f) = self.file.take() else {
+            return Ok(());
+        };
+        f.flush()?;
+        let hash = std::mem::take(&mut self.hash);
+        let part = PartFile {
+            path: self.path(self.index),
+            size: self.size,
+            sha256: hex32(&hash.finalize().into()),
+        };
+        self.state.lock().unwrap().parts.push(part);
+        self.index += 1;
+        self.size = 0;
+        Ok(())
+    }
+}
+
+impl Write for PartWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.file.is_none() {
+            let f = std::fs::File::create(self.path(self.index))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            }
+            self.file = Some(std::io::BufWriter::new(f));
+        }
+        let n = self.file.as_mut().unwrap().write(buf)?;
+        self.hash.update(&buf[..n]);
+        self.size += n as u64;
+        if self.size >= PART_SIZE {
+            self.close()?;
+        }
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match &mut self.file {
+            Some(f) => f.flush(),
+            None => Ok(()),
+        }
+    }
+}
+
+/// A package being packed and sent, with what's needed to resume it.
 pub struct Outgoing {
     pub id: TransferId,
-    pub path: PathBuf,
-    pub size: u64,
-    pub sha256: String,
+    dir: PathBuf,
     pub from: String,
     pub manifest: Manifest,
+    state: std::sync::Arc<std::sync::Mutex<PackState>>,
     /// Set once the receiver accepted: reconnects use it instead of a new code.
     resume: Option<[u8; 32]>,
 }
 
 impl Drop for Outgoing {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
 
-/// Packs the manifest's files into the outbox, reporting progress.
-pub fn pack(from: String, manifest: Manifest, on: &dyn Fn(SendEvent)) -> Result<Outgoing> {
-    let id = new_id();
-    let dir = crate::store::data_dir().join("outbox");
-    std::fs::create_dir_all(&dir)?;
-    let path = dir.join(format!("{}.tar.gz", id_hex(&id)));
-    let file = std::fs::File::create(&path).context("create the package file")?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+impl Outgoing {
+    /// Starts packing in the background; parts become sendable as they're cut.
+    pub fn start(
+        from: String,
+        manifest: Manifest,
+        on: std::sync::Arc<dyn Fn(SendEvent) + Send + Sync>,
+    ) -> Result<Outgoing> {
+        let id = new_id();
+        let outbox = crate::store::data_dir().join("outbox");
+        let dir = outbox.join(id_hex(&id));
+        std::fs::create_dir_all(&dir).context("create the outbox")?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&outbox, std::fs::Permissions::from_mode(0o700))?;
+        }
+        let state = std::sync::Arc::new(std::sync::Mutex::new(PackState::default()));
+        let mut w = PartWriter {
+            dir: dir.clone(),
+            state: state.clone(),
+            file: None,
+            hash: Sha256::new(),
+            size: 0,
+            index: 0,
+        };
+        let (st, items) = (state.clone(), manifest.items.clone());
+        std::thread::spawn(move || {
+            let total = items.iter().filter(|i| i.kind.has_files()).count();
+            let index = std::cell::Cell::new(0usize);
+            let res = package::write_files(
+                &items,
+                &mut w,
+                |_, it| {
+                    index.set(index.get() + 1);
+                    {
+                        let mut g = st.lock().unwrap();
+                        g.label = it.label.clone();
+                        g.index = index.get();
+                        g.total = total;
+                    }
+                    on(SendEvent::Packing {
+                        label: it.label.clone(),
+                        index: index.get(),
+                        total,
+                    });
+                },
+                |n| {
+                    st.lock().unwrap().packed = n;
+                    on(SendEvent::Packed(n));
+                },
+            )
+            .and_then(|_| Ok(w.close()?));
+            let mut g = st.lock().unwrap();
+            match res {
+                Ok(()) => {
+                    let size = g.parts.iter().map(|p| p.size).sum();
+                    g.done = Some(Ok(g.parts.len()));
+                    drop(g);
+                    on(SendEvent::PackDone { size });
+                }
+                Err(e) => g.done = Some(Err(format!("{e:#}"))),
+            }
+        });
+        Ok(Outgoing {
+            id,
+            dir,
+            from,
+            manifest,
+            state,
+            resume: None,
+        })
     }
-    let total = manifest.items.iter().filter(|i| i.kind.has_files()).count();
-    let index = std::cell::Cell::new(0usize);
-    let w = std::io::BufWriter::new(file);
-    let mut out = Outgoing {
-        id,
-        path: path.clone(),
-        size: 0,
-        sha256: String::new(),
-        from,
-        manifest,
-        resume: None,
-    };
-    package::write_files(
-        &out.manifest.items,
-        w,
-        |_, it| {
-            index.set(index.get() + 1);
-            on(SendEvent::Packing {
-                label: it.label.clone(),
-                index: index.get(),
-                total,
-            });
-        },
-        |n| on(SendEvent::Packed(n)),
-    )?;
-    out.size = std::fs::metadata(&path)?.len();
-    out.sha256 = sha256_file(&path)?;
-    on(SendEvent::PackDone { size: out.size });
-    Ok(out)
 }
 
 enum Attempt {
     Sent,
     Declined(String),
 }
+
+#[derive(Debug)]
+struct PackFailed(String);
+
+impl std::fmt::Display for PackFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "packing failed: {}", self.0)
+    }
+}
+
+impl std::error::Error for PackFailed {}
 
 /// Sends `out` to `addr`, retrying with backoff and resuming after drops. Returns `Ok(false)`
 /// when the other Mac declined. `cancel` stops it; `retry_now` cuts a backoff wait short.
@@ -459,6 +607,7 @@ pub fn send(
                 return Ok(false);
             }
             Err(e) if cancel.load(Ordering::Relaxed) => return Err(e.context("cancelled")),
+            Err(e) if e.downcast_ref::<PackFailed>().is_some() => return Err(e),
             Err(e) if attempt >= MAX_ATTEMPTS => {
                 return Err(anyhow!(
                     "gave up after {attempt} attempts: {}",
@@ -487,6 +636,12 @@ pub fn send(
     }
 }
 
+/// What to do next: send part `n`, or finish with this many parts.
+enum Next {
+    Part(PartFile),
+    Finish(usize),
+}
+
 fn try_send(
     addr: SocketAddr,
     out: &mut Outgoing,
@@ -500,12 +655,12 @@ fn try_send(
     stream.set_write_timeout(Some(STALL))?;
     let resume = out.resume;
     let mut ch = Channel::initiate(stream, resume.as_ref().map(|r| (&out.id, r)))?;
-    let offset = if ch.resumed {
+    if ch.resumed {
         ch.send_msg(&Msg::Resume {
             id: id_hex(&out.id),
         })?;
         match ch.recv_msg()? {
-            Msg::Accept { offset } => offset,
+            Msg::Accept { .. } => on(SendEvent::Accepted { resumed: true }),
             Msg::Decline { reason } => return Ok(Attempt::Declined(reason)),
             m => bail!("unexpected reply {m:?}"),
         }
@@ -520,53 +675,109 @@ fn try_send(
         ch.send_msg(&Msg::Offer {
             id: id_hex(&out.id),
             from: out.from.clone(),
-            size: out.size,
-            sha256: out.sha256.clone(),
             manifest: out.manifest.clone(),
         })?;
         ch.stream.set_read_timeout(Some(DECISION_TIMEOUT))?;
         let reply = ch.recv_msg()?;
         ch.stream.set_read_timeout(Some(STALL))?;
         match reply {
-            Msg::Accept { offset } => {
+            Msg::Accept { .. } => {
                 out.resume = Some(ch.resume_secret);
-                offset
+                on(SendEvent::Accepted { resumed: false });
             }
             Msg::Decline { reason } => return Ok(Attempt::Declined(reason)),
             m => bail!("unexpected reply {m:?}"),
         }
-    };
-    if offset > out.size {
-        bail!("the other Mac has more than was sent");
     }
-    on(SendEvent::Sending {
-        offset,
-        resumed: offset > 0,
-    });
-    let mut f = std::fs::File::open(&out.path)?;
-    f.seek(SeekFrom::Start(offset))?;
+
+    // Parts are offered in order; the receiver skips ones it already has.
+    let mut delivered = 0u64;
+    let mut index = 0usize;
+    let mut first = true;
     let mut buf = vec![0u8; CHUNK];
-    let mut sent = offset;
     loop {
-        if cancel.load(Ordering::Relaxed) {
-            bail!("cancelled");
+        let next = loop {
+            if cancel.load(Ordering::Relaxed) {
+                bail!("cancelled");
+            }
+            let status = {
+                let g = out.state.lock().unwrap();
+                if let Some(p) = g.parts.get(index) {
+                    break Next::Part(p.clone());
+                }
+                match &g.done {
+                    Some(Ok(n)) => break Next::Finish(*n),
+                    Some(Err(e)) => return Err(PackFailed(e.clone()).into()),
+                    None => Msg::Status {
+                        label: g.label.clone(),
+                        index: g.index,
+                        total: g.total,
+                        packed: g.packed,
+                    },
+                }
+            };
+            // Keeps the other Mac posted (and the connection alive) while packing catches up.
+            ch.send_msg(&status)?;
+            std::thread::sleep(Duration::from_millis(300));
+        };
+        let part = match next {
+            Next::Part(p) => p,
+            Next::Finish(parts) => {
+                ch.send_msg(&Msg::Finish {
+                    parts,
+                    size: delivered,
+                })?;
+                on(SendEvent::Verifying);
+                ch.stream.set_read_timeout(Some(Duration::from_secs(120)))?;
+                return match ch.recv_msg()? {
+                    Msg::Received => Ok(Attempt::Sent),
+                    m => bail!("unexpected reply {m:?}"),
+                };
+            }
+        };
+        ch.send_msg(&Msg::Part {
+            index,
+            size: part.size,
+            sha256: part.sha256.clone(),
+        })?;
+        let offset = match ch.recv_msg()? {
+            Msg::Accept { offset } => offset.min(part.size),
+            Msg::Decline { reason } => return Ok(Attempt::Declined(reason)),
+            m => bail!("unexpected reply {m:?}"),
+        };
+        let already = delivered + offset;
+        if first && already > 0 {
+            on(SendEvent::Resumed(already));
         }
-        let n = f.read(&mut buf)?;
-        if n == 0 {
-            break;
+        if offset < part.size {
+            first = false;
+            let mut f = std::fs::File::open(&part.path)?;
+            f.seek(SeekFrom::Start(offset))?;
+            let mut sent = offset;
+            loop {
+                if cancel.load(Ordering::Relaxed) {
+                    bail!("cancelled");
+                }
+                let n = f.read(&mut buf)?;
+                if n == 0 {
+                    break;
+                }
+                ch.send_frame(KIND_DATA, &buf[..n])?;
+                sent += n as u64;
+                on(SendEvent::Progress(delivered + sent));
+            }
+            ch.send_frame(KIND_END, &[])?;
+            match ch.recv_msg()? {
+                Msg::PartOk => {}
+                Msg::Corrupt => bail!("part {} arrived damaged; sending it again", index + 1),
+                m => bail!("unexpected reply {m:?}"),
+            }
         }
-        ch.send_frame(KIND_DATA, &buf[..n])?;
-        sent += n as u64;
-        on(SendEvent::Progress(sent));
-    }
-    ch.send_frame(KIND_END, &[])?;
-    on(SendEvent::Verifying);
-    // Hashing a big package takes a while on the other side.
-    ch.stream.set_read_timeout(Some(Duration::from_secs(300)))?;
-    match ch.recv_msg()? {
-        Msg::Received => Ok(Attempt::Sent),
-        Msg::Corrupt => bail!("the package arrived damaged; sending it again"),
-        m => bail!("unexpected reply {m:?}"),
+        delivered += part.size;
+        on(SendEvent::Progress(delivered));
+        // Delivered and checked: the receiver has it on disk, so the copy here can go.
+        let _ = std::fs::remove_file(&part.path);
+        index += 1;
     }
 }
 
@@ -673,34 +884,43 @@ pub struct Offer {
     pub id: String,
     pub from: String,
     pub code: String,
-    pub size: u64,
     pub manifest: Manifest,
 }
 
 /// What the receiver sees while a transfer runs.
 #[derive(Debug, Clone)]
 pub enum RecvEvent {
-    /// Receiving transfer `id` from `from`, starting at `offset` of `size` bytes.
-    Started {
+    /// Connected (or reconnected) to transfer `id` from `from`; `have` bytes are already here.
+    Connected {
         id: String,
         from: String,
-        size: u64,
-        offset: u64,
         resumed: bool,
+        have: u64,
     },
+    /// The sender is packing; `packed` bytes so far.
+    Packing {
+        id: String,
+        label: String,
+        index: usize,
+        total: usize,
+        packed: u64,
+    },
+    /// Bytes received so far, across all parts.
     Progress {
         id: String,
         received: u64,
     },
-    Verifying {
+    /// All parts arrived: `size` bytes.
+    Finishing {
         id: String,
+        size: u64,
     },
     /// The connection dropped; the sender will reconnect and resume.
     Interrupted {
         id: String,
         error: String,
     },
-    /// The finished file was damaged and thrown away; the sender sends it again.
+    /// A part was damaged and thrown away; the sender sends it again.
     Corrupt {
         id: String,
     },
@@ -730,10 +950,13 @@ pub struct Saved {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Pending {
     from: String,
-    size: u64,
-    sha256: String,
     manifest: Manifest,
     resume: String,
+    /// Parts appended to `<id>.part` so far, and its length after them.
+    #[serde(default)]
+    parts_done: usize,
+    #[serde(default)]
+    assembled: u64,
 }
 
 pub fn inbox() -> PathBuf {
@@ -746,6 +969,11 @@ pub fn package_path(id: &str) -> PathBuf {
 
 fn part_path(id: &str) -> PathBuf {
     inbox().join(format!("{id}.part"))
+}
+
+/// The part currently arriving.
+fn current_path(id: &str) -> PathBuf {
+    inbox().join(format!("{id}.cur"))
 }
 
 fn meta_path(id: &str) -> PathBuf {
@@ -761,6 +989,7 @@ fn load_pending(id: &str) -> Option<Pending> {
 pub fn discard(id: &str) {
     let _ = std::fs::remove_file(meta_path(id));
     let _ = std::fs::remove_file(part_path(id));
+    let _ = std::fs::remove_file(current_path(id));
 }
 
 /// Packages received earlier, newest first.
@@ -815,7 +1044,7 @@ fn receive(stream: TcpStream, rx: &dyn Receiver) -> Result<()> {
     let mut ch = Channel::respond(stream, |id| {
         load_pending(&id_hex(id)).and_then(|p| unhex::<32>(&p.resume))
     })?;
-    let (id, pending, resumed) = match ch.recv_msg()? {
+    let (id, mut pending, resumed) = match ch.recv_msg()? {
         Msg::Ping => {
             ch.send_msg(&Msg::Pong {
                 name: rx.name(),
@@ -832,13 +1061,7 @@ fn receive(stream: TcpStream, rx: &dyn Receiver) -> Result<()> {
                 return Ok(());
             }
         },
-        Msg::Offer {
-            id,
-            from,
-            size,
-            sha256,
-            manifest,
-        } if !ch.resumed => {
+        Msg::Offer { id, from, manifest } if !ch.resumed => {
             if unhex::<16>(&id).is_none() {
                 bail!("bad transfer id");
             }
@@ -852,7 +1075,6 @@ fn receive(stream: TcpStream, rx: &dyn Receiver) -> Result<()> {
                 id: id.clone(),
                 from: from.clone(),
                 code: ch.code.clone(),
-                size,
                 manifest: manifest.clone(),
             });
             if !accepted {
@@ -863,10 +1085,10 @@ fn receive(stream: TcpStream, rx: &dyn Receiver) -> Result<()> {
             }
             let p = Pending {
                 from,
-                size,
-                sha256,
                 manifest,
                 resume: hex32(&ch.resume_secret),
+                parts_done: 0,
+                assembled: 0,
             };
             std::fs::create_dir_all(inbox())?;
             write_private(&meta_path(&id), &serde_json::to_vec(&p)?)?;
@@ -874,69 +1096,140 @@ fn receive(stream: TcpStream, rx: &dyn Receiver) -> Result<()> {
         }
         m => bail!("unexpected {m:?}"),
     };
-    let part = part_path(&id);
-    let mut f = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&part)?;
-    #[cfg(unix)]
+    // Undo an append that happened after the last saved state (a crash between the two).
+    let assembled = part_path(&id);
     {
-        use std::os::unix::fs::PermissionsExt;
-        f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        let f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&assembled)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+        if f.metadata()?.len() != pending.assembled {
+            f.set_len(pending.assembled)?;
+        }
     }
-    let offset = f.metadata()?.len().min(pending.size);
-    f.set_len(offset)?;
-    ch.send_msg(&Msg::Accept { offset })?;
-    rx.event(RecvEvent::Started {
+    let cur = current_path(&id);
+    let have = pending.assembled + std::fs::metadata(&cur).map(|m| m.len()).unwrap_or(0);
+    ch.send_msg(&Msg::Accept { offset: 0 })?;
+    rx.event(RecvEvent::Connected {
         id: id.clone(),
         from: pending.from.clone(),
-        size: pending.size,
-        offset,
         resumed,
+        have,
     });
     ch.stream.set_read_timeout(Some(STALL))?;
-    let mut received = offset;
-    let mut frames = 0u32;
-    let res = (|| -> Result<()> {
+    let res = (|| -> Result<Option<usize>> {
         loop {
-            match ch.recv_frame()? {
-                (KIND_DATA, b) => {
-                    f.write_all(&b)?;
-                    received += b.len() as u64;
-                    rx.event(RecvEvent::Progress {
+            match ch.recv_msg()? {
+                Msg::Status {
+                    label,
+                    index,
+                    total,
+                    packed,
+                } => {
+                    rx.event(RecvEvent::Packing {
                         id: id.clone(),
-                        received,
+                        label,
+                        index,
+                        total,
+                        packed,
                     });
-                    frames += 1;
-                    if frames.is_multiple_of(32) && !meta_path(&id).exists() {
+                    if !meta_path(&id).exists() {
                         bail!("cancelled on this Mac");
                     }
                 }
-                (KIND_END, _) => return Ok(()),
-                _ => bail!("unexpected message during transfer"),
+                Msg::Part {
+                    index,
+                    size,
+                    sha256,
+                } => {
+                    if index < pending.parts_done {
+                        ch.send_msg(&Msg::Accept { offset: size })?;
+                        continue;
+                    }
+                    if index > pending.parts_done {
+                        bail!("part {index} came before part {}", pending.parts_done);
+                    }
+                    let mut f = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&cur)?;
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+                    }
+                    let offset = f.metadata()?.len().min(size);
+                    f.set_len(offset)?;
+                    ch.send_msg(&Msg::Accept { offset })?;
+                    let mut got = offset;
+                    let mut frames = 0u32;
+                    loop {
+                        match ch.recv_frame()? {
+                            (KIND_DATA, b) => {
+                                f.write_all(&b)?;
+                                got += b.len() as u64;
+                                rx.event(RecvEvent::Progress {
+                                    id: id.clone(),
+                                    received: pending.assembled + got,
+                                });
+                                frames += 1;
+                                if frames.is_multiple_of(32) && !meta_path(&id).exists() {
+                                    bail!("cancelled on this Mac");
+                                }
+                            }
+                            (KIND_END, _) => break,
+                            _ => bail!("unexpected message during transfer"),
+                        }
+                    }
+                    f.sync_all()?;
+                    drop(f);
+                    if got != size || sha256_file(&cur)? != sha256 {
+                        let _ = std::fs::remove_file(&cur);
+                        ch.send_msg(&Msg::Corrupt)?;
+                        rx.event(RecvEvent::Corrupt { id: id.clone() });
+                        continue;
+                    }
+                    // Append the checked part to the package, then record that it's there.
+                    let mut a = std::fs::OpenOptions::new().append(true).open(&assembled)?;
+                    std::io::copy(&mut std::fs::File::open(&cur)?, &mut a)?;
+                    a.sync_all()?;
+                    pending.parts_done += 1;
+                    pending.assembled += size;
+                    write_private(&meta_path(&id), &serde_json::to_vec(&pending)?)?;
+                    let _ = std::fs::remove_file(&cur);
+                    ch.send_msg(&Msg::PartOk)?;
+                }
+                Msg::Finish { parts, size } => {
+                    if parts != pending.parts_done || size != pending.assembled {
+                        bail!(
+                            "expected {parts} parts ({size} bytes), have {} ({} bytes)",
+                            pending.parts_done,
+                            pending.assembled
+                        );
+                    }
+                    rx.event(RecvEvent::Finishing {
+                        id: id.clone(),
+                        size,
+                    });
+                    return Ok(Some(parts));
+                }
+                m => bail!("unexpected {m:?}"),
             }
         }
     })();
     if let Err(e) = res {
-        let _ = f.sync_all();
         rx.event(RecvEvent::Interrupted {
             id: id.clone(),
             error: friendly(&e),
         });
         return Err(e);
     }
-    f.sync_all()?;
-    drop(f);
-    rx.event(RecvEvent::Verifying { id: id.clone() });
-    let ok =
-        std::fs::metadata(&part)?.len() == pending.size && sha256_file(&part)? == pending.sha256;
-    if !ok {
-        let _ = std::fs::remove_file(&part);
-        ch.send_msg(&Msg::Corrupt)?;
-        rx.event(RecvEvent::Corrupt { id });
-        return Ok(());
-    }
-    std::fs::rename(&part, package_path(&id))?;
+    std::fs::rename(&assembled, package_path(&id))?;
     write_private(
         &inbox().join(format!("{id}.json")),
         &serde_json::to_vec_pretty(&pending.manifest)?,
@@ -1071,15 +1364,38 @@ mod tests {
             }
             log.lock().unwrap().push(e);
         };
-        let mut out = pack("laptop".into(), manifest(), &on).unwrap();
-        // Replace the tiny package with 3 MB of noise so the cut lands mid-stream.
+        // 3 MB of noise packs into one ~3 MB part; with parts this small in the test the cut
+        // lands mid-stream either way.
         let mut noise = vec![0u8; 3 << 20];
         getrandom::getrandom(&mut noise).unwrap();
-        std::fs::write(&out.path, &noise).unwrap();
-        out.size = noise.len() as u64;
-        out.sha256 = sha256_file(&out.path).unwrap();
-
-        let proxy = flaky_proxy(direct, 1 << 20);
+        let src = tmp.join("noise.bin");
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(&src, &noise).unwrap();
+        let mut out =
+            Outgoing::start("laptop".into(), manifest(), std::sync::Arc::new(|_| {})).unwrap();
+        // Swap the packed output for the noise, split into three parts, as if just packed.
+        loop {
+            if out.state.lock().unwrap().done.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        {
+            let mut g = out.state.lock().unwrap();
+            g.parts.clear();
+            for (i, chunk) in noise.chunks(1 << 20).enumerate() {
+                let path = out.dir.join(format!("t{i}"));
+                std::fs::write(&path, chunk).unwrap();
+                g.parts.push(PartFile {
+                    path,
+                    size: chunk.len() as u64,
+                    sha256: hex32(&Sha256::digest(chunk).into()),
+                });
+            }
+            g.done = Some(Ok(3));
+        }
+        // Cut the first connection 1.5 MB in: part 1 is through, part 2 half way.
+        let proxy = flaky_proxy(direct, (3 << 20) / 2);
         let (cancel, now) = (AtomicBool::new(false), AtomicBool::new(true));
         assert!(send(proxy, &mut out, &cancel, &now, &on).unwrap());
 
@@ -1088,7 +1404,7 @@ mod tests {
         assert!(log.iter().any(|e| matches!(e, SendEvent::Retrying { .. })));
         assert!(
             log.iter()
-                .any(|e| matches!(e, SendEvent::Sending { resumed: true, .. }))
+                .any(|e| matches!(e, SendEvent::Resumed(n) if *n >= 1 << 20))
         );
         let done = loop {
             match events.recv_timeout(Duration::from_secs(10)).unwrap() {

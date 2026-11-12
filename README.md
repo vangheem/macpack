@@ -51,10 +51,11 @@ credentials (`~/.ssh`, `~/.aws`, `~/.config/gh`…) are flagged.
    **Apply to this Mac**.
 
 While a package moves, both Macs switch to a transfer screen with each step, the code,
-progress, speed, time left and an activity log. The package is packed into a file first, so a
-dropped or stalled connection is retried automatically (with backoff, up to 30 attempts) and
-picks up at the byte where it stopped, without a new code. The receiver checks the size and
-SHA-256 before filing it; a damaged package is sent again. An interrupted transfer also
+progress, speed, time left and an activity log. The other Mac is asked to accept right away, while
+packing starts. The package is cut into ~16 MB parts as it's packed, and each part is sent and
+checked (SHA-256) while the next is still packing. A dropped or stalled connection is retried
+automatically (with backoff, up to 30 attempts) and picks up at the byte where it stopped,
+without a new code; a damaged part is sent again. An interrupted transfer also
 resumes after the receiving Mac's macpack restarts.
 
 Applying copies files first (so apps find their settings when they're installed), then runs
