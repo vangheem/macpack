@@ -1,0 +1,81 @@
+name: Release new version
+
+# Actions → "Release new version" → Run workflow, then pick the bump.
+# Bumps Cargo.toml and Cargo.lock on main, commits, and pushes a `vX.Y.Z` tag. The tag starts
+# release.yml, which builds, publishes the GitHub release and updates the Homebrew tap.
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: "Version bump"
+        required: true
+        default: patch
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+
+concurrency:
+  group: bump-version
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  bump:
+    name: Bump ${{ inputs.bump }} and tag
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+          # Pushes go over SSH with the deploy key: pushes made with GITHUB_TOKEN don't start
+          # other workflows, and the tag has to start release.yml.
+          ssh-key: ${{ secrets.RELEASE_DEPLOY_KEY }}
+          fetch-depth: 0
+
+      - name: Compute version
+        id: version
+        run: |
+          current=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          IFS=. read -r major minor patch <<< "$current"
+          case "${{ inputs.bump }}" in
+            major) major=$((major + 1)); minor=0; patch=0 ;;
+            minor) minor=$((minor + 1)); patch=0 ;;
+            patch) patch=$((patch + 1)) ;;
+          esac
+          next="$major.$minor.$patch"
+          if git rev-parse -q --verify "refs/tags/v$next" >/dev/null; then
+            echo "::error::tag v$next already exists"
+            exit 1
+          fi
+          echo "current=$current" >> "$GITHUB_OUTPUT"
+          echo "next=$next" >> "$GITHUB_OUTPUT"
+          echo "Bumping $current → $next"
+
+      - name: Update Cargo.toml and Cargo.lock
+        env:
+          CURRENT: ${{ steps.version.outputs.current }}
+          NEXT: ${{ steps.version.outputs.next }}
+        run: |
+          # Only the package's own version line, the first `version =` in Cargo.toml.
+          sed -i "0,/^version = \"$CURRENT\"/s//version = \"$NEXT\"/" Cargo.toml
+          # The lockfile entry directly under `name = "macpack"`.
+          perl -0pi -e "s/(name = \"macpack\"\nversion = )\"\Q$CURRENT\E\"/\${1}\"$NEXT\"/" Cargo.lock
+          git diff
+          grep -q "^version = \"$NEXT\"" Cargo.toml
+          grep -A1 '^name = "macpack"' Cargo.lock | grep -q "version = \"$NEXT\""
+
+      - name: Commit, tag and push
+        env:
+          NEXT: ${{ steps.version.outputs.next }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -am "Release v$NEXT"
+          git tag -a "v$NEXT" -m "v$NEXT"
+          git push origin main "v$NEXT"
+          echo "Tagged v$NEXT; release.yml takes it from here." >> "$GITHUB_STEP_SUMMARY"
