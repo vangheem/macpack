@@ -1,5 +1,4 @@
-//! What's on this Mac: Homebrew taps, formulae and casks, App Store apps, VS Code extensions,
-//! apps nothing can reinstall, dotfiles, macOS preference domains, and folders the user added.
+//! What's on this Mac: Homebrew taps, formulae and casks, App Store apps, apps nothing can reinstall, dotfiles, macOS preference domains, and folders the user added.
 //!
 //! Everything is an [`Item`] keyed by `kind:id`; the package is the selected items.
 
@@ -15,7 +14,6 @@ pub enum Kind {
     Formula,
     Cask,
     MasApp,
-    VscodeExt,
     Dotfile,
     Folder,
     Defaults,
@@ -23,12 +21,11 @@ pub enum Kind {
 }
 
 impl Kind {
-    pub const ALL: [Kind; 9] = [
+    pub const ALL: [Kind; 8] = [
         Kind::Cask,
         Kind::MasApp,
         Kind::Formula,
         Kind::Tap,
-        Kind::VscodeExt,
         Kind::Dotfile,
         Kind::Folder,
         Kind::Defaults,
@@ -41,7 +38,6 @@ impl Kind {
             Kind::Formula => "Homebrew formulae",
             Kind::Cask => "Apps from Homebrew",
             Kind::MasApp => "Apps from the App Store",
-            Kind::VscodeExt => "VS Code extensions",
             Kind::Dotfile => "Settings and dotfiles",
             Kind::Folder => "Folders",
             Kind::Defaults => "macOS preferences",
@@ -628,8 +624,7 @@ pub fn scan(folders: &BTreeSet<String>, on: OnProgress) -> Inventory {
 const DOTFILES: &str = "Settings and dotfiles";
 const FOLDERS: &str = "Folders";
 
-/// What gets reinstalled rather than copied: taps, formulae, casks, App Store apps, VS Code
-/// extensions, and (last) the apps nothing can reinstall.
+/// What gets reinstalled rather than copied: taps, formulae, casks, App Store apps, and (last) the apps nothing can reinstall.
 pub fn installs(on: OnProgress) -> Inventory {
     let mut inv = Inventory::default();
     let mut from_casks = HashSet::new();
@@ -678,18 +673,6 @@ pub fn installs(on: OnProgress) -> Inventory {
             "App Store apps are listed with `mas` (brew install mas); without it they show under Other apps."
                 .into(),
         ),
-    }
-    if let Some(code) = which("code").or_else(|| {
-        let p =
-            PathBuf::from("/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code");
-        p.exists().then_some(p)
-    }) {
-        inv.items.extend(step(on, "VS Code extensions", || {
-            lines(&code, &["--list-extensions"])
-                .iter()
-                .map(|e| Item::new(Kind::VscodeExt, e, e))
-                .collect()
-        }));
     }
     let installed: HashSet<String> = inv
         .items

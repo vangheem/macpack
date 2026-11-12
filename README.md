@@ -28,7 +28,6 @@ are copied.
 | Homebrew taps, formulae and casks | Reinstalled with `brew bundle` |
 | Apps you installed by hand (Signal, Chrome, Zed…) | Matched to their Homebrew cask and reinstalled |
 | App Store apps | Reinstalled with [`mas`](https://github.com/mas-cli/mas) |
-| VS Code extensions | Reinstalled with `brew bundle` |
 | Dotfiles and `~/.config/*` | Copied, including `~/.ssh` (permissions are fixed) |
 | Folders you add (`~/projects`) | Copied, minus `node_modules`, `.venv` and `__pycache__` |
 | macOS preferences (Dock, Finder, trackpad…) | `defaults export` / `import`; off unless you turn them on |

@@ -50,7 +50,7 @@ fn brew_opt_path(exe: &Path) -> Option<PathBuf> {
 }
 
 /// The launcher: picks up the login shell's PATH (apps opened from Finder get a bare one, and
-/// macpack needs `brew`, `mas` and `code`), then becomes the real binary.
+/// macpack needs `brew` and `mas`), then becomes the real binary.
 fn launcher(binary: &Path) -> String {
     let bin = binary.display().to_string().replace('\'', r"'\''");
     format!(

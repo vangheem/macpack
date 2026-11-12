@@ -121,7 +121,7 @@ fn init() -> App {
         page: Page::Inventory,
         inventory: Inventory::load_cached(),
         scanning: false,
-        collapsed: [Kind::Formula, Kind::Tap, Kind::VscodeExt, Kind::Defaults]
+        collapsed: [Kind::Formula, Kind::Tap, Kind::Defaults]
             .into_iter()
             .map(|k| (false, k))
             .collect(),
@@ -967,12 +967,12 @@ fn summary(items: &[Item]) -> String {
         .count();
     let tools = items
         .iter()
-        .filter(|i| matches!(i.kind, Kind::Formula | Kind::Tap | Kind::VscodeExt))
+        .filter(|i| matches!(i.kind, Kind::Formula | Kind::Tap))
         .count();
     let files: Vec<&Item> = items.iter().filter(|i| i.kind.has_files()).collect();
     let size: u64 = files.iter().filter_map(|i| i.size).sum();
     format!(
-        "{apps} apps · {tools} tools and extensions · {} settings and folders ({})",
+        "{apps} apps · {tools} tools · {} settings and folders ({})",
         files.len(),
         human_size(size)
     )
@@ -1544,14 +1544,14 @@ fn dialogs(s: &App, k: &Kit, layer: &mut Vec<El>) {
                 .filter(|i| {
                     matches!(
                         i.kind,
-                        Kind::Tap | Kind::Formula | Kind::Cask | Kind::MasApp | Kind::VscodeExt
+                        Kind::Tap | Kind::Formula | Kind::Cask | Kind::MasApp
                     )
                 })
                 .count();
             let mut body = vec![muted(
                 k,
                 format!(
-                    "Copies {files} settings and folders into your home folder (existing files are moved to a backup first), then installs {installs} apps, tools and extensions with Homebrew."
+                    "Copies {files} settings and folders into your home folder (existing files are moved to a backup first), then installs {installs} apps, tools with Homebrew."
                 ),
             )];
             if chosen.iter().any(|i| i.kind == Kind::MasApp) {
@@ -1769,13 +1769,6 @@ fn demo_items() -> Vec<Item> {
         demo_item(Kind::Formula, "gh", "gh", "", None),
         demo_item(Kind::Formula, "ripgrep", "ripgrep", "", None),
         demo_item(Kind::Tap, "vangheem/tap", "vangheem/tap", "", None),
-        demo_item(
-            Kind::VscodeExt,
-            "rust-lang.rust-analyzer",
-            "rust-lang.rust-analyzer",
-            "",
-            None,
-        ),
         demo_item(Kind::Dotfile, ".zshrc", "~/.zshrc", "", Some(2_400)),
         demo_item(Kind::Dotfile, ".gitconfig", "~/.gitconfig", "", Some(612)),
         demo_item(

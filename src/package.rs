@@ -147,18 +147,11 @@ pub fn write_files<W: Write>(items: &[Item], w: W, progress: impl Fn(u64)) -> Re
     Ok(())
 }
 
-/// The Brewfile that reinstalls the selected taps, formulae, casks, App Store apps and
-/// VS Code extensions.
+/// The Brewfile that reinstalls the selected taps, formulae, casks and App Store apps.
 pub fn brewfile(items: &[&Item]) -> String {
     let q = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
     let mut out = String::new();
-    for kind in [
-        Kind::Tap,
-        Kind::Formula,
-        Kind::Cask,
-        Kind::MasApp,
-        Kind::VscodeExt,
-    ] {
+    for kind in [Kind::Tap, Kind::Formula, Kind::Cask, Kind::MasApp] {
         for it in items.iter().filter(|i| i.kind == kind) {
             let line = match kind {
                 Kind::Tap => format!("tap \"{}\"", q(&it.id)),
@@ -168,7 +161,6 @@ pub fn brewfile(items: &[&Item]) -> String {
                     Ok(id) => format!("mas \"{}\", id: {id}", q(&it.label)),
                     Err(_) => continue,
                 },
-                Kind::VscodeExt => format!("vscode \"{}\"", q(&it.id)),
                 _ => continue,
             };
             out.push_str(&line);
@@ -392,7 +384,7 @@ pub fn apply(pkg: &Path, manifest: &Manifest, keys: &HashSet<String>, log: &dyn 
                 .arg(&file)
                 .env("HOMEBREW_NO_ENV_HINTS", "1")
                 .env("HOMEBREW_NO_INSTALL_CLEANUP", "1");
-            // Lets brew find `mas` and `code` once it has installed them.
+            // Lets brew find `mas` once it has installed them.
             if let Some(dir) = brew.parent() {
                 let path = std::env::var_os("PATH").unwrap_or_default();
                 let mut paths = vec![dir.to_path_buf()];
@@ -476,13 +468,12 @@ mod tests {
             item(Kind::Tap, "vangheem/tap", "vangheem/tap"),
             item(Kind::Formula, "gh", "gh"),
             item(Kind::MasApp, "497799835", "Xcode"),
-            item(Kind::VscodeExt, "rust-lang.rust-analyzer", ""),
             item(Kind::Dotfile, ".zshrc", "~/.zshrc"),
         ];
         let refs: Vec<&Item> = items.iter().collect();
         assert_eq!(
             brewfile(&refs),
-            "tap \"vangheem/tap\"\nbrew \"gh\"\ncask \"signal\"\nmas \"Xcode\", id: 497799835\nvscode \"rust-lang.rust-analyzer\"\n"
+            "tap \"vangheem/tap\"\nbrew \"gh\"\ncask \"signal\"\nmas \"Xcode\", id: 497799835\n"
         );
     }
 
