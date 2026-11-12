@@ -262,7 +262,7 @@ pub fn dotfile_item(rel: &str) -> Item {
 }
 
 /// Home dotfiles, with `~/.config` split into its children.
-pub fn dotfiles() -> Vec<Item> {
+pub fn dotfiles(on: OnProgress) -> Vec<Item> {
     let home = home();
     let mut rels = Vec::new();
     for e in std::fs::read_dir(&home).into_iter().flatten().flatten() {
@@ -289,7 +289,12 @@ pub fn dotfiles() -> Vec<Item> {
     std::thread::scope(|sc| {
         let handles: Vec<_> = rels
             .iter()
-            .map(|r| sc.spawn(move || dotfile_item(r)))
+            .map(|r| {
+                sc.spawn(move || {
+                    on(Progress::Detail(DOTFILES, format!("~/{r}")));
+                    dotfile_item(r)
+                })
+            })
             .collect();
         handles.into_iter().filter_map(|h| h.join().ok()).collect()
     })
@@ -528,24 +533,83 @@ fn manual_apps(from_casks: &HashSet<String>, catalogue: &HashMap<String, String>
     items
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Inventory {
     pub items: Vec<Item>,
     /// Missing tools worth telling the user about ("mas isn't installed…").
     pub notes: Vec<String>,
+    /// Unix seconds when the scan finished.
+    #[serde(default)]
+    pub scanned: u64,
+}
+
+/// What a running scan reports, for showing progress. Steps run in parallel, so several can
+/// be under way at once.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Progress {
+    Start(&'static str),
+    /// What the step is looking at now (`~/.config/zed`).
+    Detail(&'static str, String),
+    /// Finished, with a short result ("35 found").
+    Done(&'static str, String),
+}
+
+pub type OnProgress<'a> = &'a (dyn Fn(Progress) + Sync);
+
+/// Runs `f` as a progress step, reporting how many items it found.
+fn step<T>(on: OnProgress, name: &'static str, f: impl FnOnce() -> Vec<T>) -> Vec<T> {
+    on(Progress::Start(name));
+    let out = f();
+    on(Progress::Done(name, format!("{} found", out.len())));
+    out
+}
+
+fn cache_path() -> PathBuf {
+    crate::store::data_dir().join("inventory.json")
+}
+
+impl Inventory {
+    /// The last scan, so a relaunch shows it straight away while a fresh scan runs.
+    pub fn load_cached() -> Option<Inventory> {
+        serde_json::from_slice(&std::fs::read(cache_path()).ok()?).ok()
+    }
+
+    pub fn save_cached(&self) {
+        let p = cache_path();
+        let _ = std::fs::create_dir_all(p.parent().unwrap());
+        let _ = std::fs::write(p, serde_json::to_vec(self).unwrap_or_default());
+    }
 }
 
 /// Scans this Mac. Slow (seconds): run it off the UI thread.
-pub fn scan(folders: &BTreeSet<String>) -> Inventory {
+pub fn scan(folders: &BTreeSet<String>, on: OnProgress) -> Inventory {
     let (mut inv, files, dirs) = std::thread::scope(|sc| {
-        let files = sc.spawn(dotfiles);
-        let dirs: Vec<_> = folders
-            .iter()
-            .map(|f| sc.spawn(move || folder_item(f)))
-            .collect();
-        let inv = installs();
-        let dirs: Vec<Item> = dirs.into_iter().filter_map(|h| h.join().ok()).collect();
-        (inv, files.join().unwrap_or_default(), dirs)
+        let files = sc.spawn(|| step(on, DOTFILES, || dotfiles(on)));
+        let dirs = sc.spawn(|| {
+            if folders.is_empty() {
+                return Vec::new();
+            }
+            step(on, FOLDERS, || {
+                std::thread::scope(|sc| {
+                    let hs: Vec<_> = folders
+                        .iter()
+                        .map(|f| {
+                            sc.spawn(move || {
+                                on(Progress::Detail(FOLDERS, format!("~/{f}")));
+                                folder_item(f)
+                            })
+                        })
+                        .collect();
+                    hs.into_iter().filter_map(|h| h.join().ok()).collect()
+                })
+            })
+        });
+        let inv = installs(on);
+        (
+            inv,
+            files.join().unwrap_or_default(),
+            dirs.join().unwrap_or_default(),
+        )
     });
     let manual = inv.items.split_off(
         inv.items
@@ -557,33 +621,45 @@ pub fn scan(folders: &BTreeSet<String>) -> Inventory {
     inv.items.extend(dirs);
     inv.items.extend(defaults_items());
     inv.items.extend(manual);
+    inv.scanned = crate::package::now();
     inv
 }
 
+const DOTFILES: &str = "Settings and dotfiles";
+const FOLDERS: &str = "Folders";
+
 /// What gets reinstalled rather than copied: taps, formulae, casks, App Store apps, VS Code
 /// extensions, and (last) the apps nothing can reinstall.
-pub fn installs() -> Inventory {
+pub fn installs(on: OnProgress) -> Inventory {
     let mut inv = Inventory::default();
     let mut from_casks = HashSet::new();
     match brew() {
         Some(brew) => {
-            for t in lines(&brew, &["tap"]) {
-                if t == "homebrew/core" || t == "homebrew/cask" {
-                    continue;
+            inv.items.extend(step(on, "Homebrew taps", || {
+                lines(&brew, &["tap"])
+                    .into_iter()
+                    .filter(|t| t != "homebrew/core" && t != "homebrew/cask")
+                    .map(|t| Item::new(Kind::Tap, &t, &t))
+                    .collect()
+            }));
+            inv.items.extend(step(on, "Homebrew formulae", || {
+                let mut leaves = lines(&brew, &["leaves", "--installed-on-request"]);
+                if leaves.is_empty() {
+                    leaves = lines(&brew, &["leaves"]);
                 }
-                inv.items.push(Item::new(Kind::Tap, &t, &t));
-            }
-            let mut leaves = lines(&brew, &["leaves", "--installed-on-request"]);
-            if leaves.is_empty() {
-                leaves = lines(&brew, &["leaves"]);
-            }
-            for f in leaves {
-                let label = f.rsplit('/').next().unwrap_or(&f).to_string();
-                inv.items.push(Item::new(Kind::Formula, &f, label));
-            }
-            let (casks, apps) = cask_apps(&brew);
-            inv.items.extend(casks);
-            from_casks = apps;
+                leaves
+                    .into_iter()
+                    .map(|f| {
+                        let label = f.rsplit('/').next().unwrap_or(&f).to_string();
+                        Item::new(Kind::Formula, &f, label)
+                    })
+                    .collect()
+            }));
+            inv.items.extend(step(on, "Apps from Homebrew", || {
+                let (casks, apps) = cask_apps(&brew);
+                from_casks = apps;
+                casks
+            }));
         }
         None => inv
             .notes
@@ -595,7 +671,9 @@ pub fn installs() -> Inventory {
             .map(PathBuf::from)
             .find(|p| p.exists())
     }) {
-        Some(mas) => inv.items.extend(parse_mas(&lines(&mas, &["list"]))),
+        Some(mas) => inv.items.extend(step(on, "App Store apps", || {
+            parse_mas(&lines(&mas, &["list"]))
+        })),
         None => inv.notes.push(
             "App Store apps are listed with `mas` (brew install mas); without it they show under Other apps."
                 .into(),
@@ -606,9 +684,12 @@ pub fn installs() -> Inventory {
             PathBuf::from("/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code");
         p.exists().then_some(p)
     }) {
-        for ext in lines(&code, &["--list-extensions"]) {
-            inv.items.push(Item::new(Kind::VscodeExt, &ext, &ext));
-        }
+        inv.items.extend(step(on, "VS Code extensions", || {
+            lines(&code, &["--list-extensions"])
+                .iter()
+                .map(|e| Item::new(Kind::VscodeExt, e, e))
+                .collect()
+        }));
     }
     let installed: HashSet<String> = inv
         .items
@@ -616,7 +697,15 @@ pub fn installs() -> Inventory {
         .filter(|i| i.kind == Kind::Cask)
         .map(|i| i.id.clone())
         .collect();
-    let (casks, manual): (Vec<Item>, Vec<Item>) = manual_apps(&from_casks, &cask_catalogue())
+    const APPS: &str = "Other apps in /Applications";
+    on(Progress::Start(APPS));
+    on(Progress::Detail(
+        APPS,
+        "Matching them to Homebrew casks".into(),
+    ));
+    let found = manual_apps(&from_casks, &cask_catalogue());
+    on(Progress::Done(APPS, format!("{} found", found.len())));
+    let (casks, manual): (Vec<Item>, Vec<Item>) = found
         .into_iter()
         .filter(|i| !(i.kind == Kind::Cask && installed.contains(&i.id)))
         .partition(|i| i.kind == Kind::Cask);

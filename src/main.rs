@@ -54,6 +54,7 @@ enum Confirm {
     Update,
     Apply,
     Delete(String),
+    DeleteSet(String),
 }
 
 struct Sending {
@@ -97,6 +98,10 @@ struct App {
     apply_log: Vec<Log>,
     applied_ok: Option<bool>,
     add_folder: Option<TextEdit>,
+    /// The "Save selection as" dialog's name field.
+    save_set: Option<TextEdit>,
+    /// The running scan's steps: name, what it's looking at or found, finished.
+    scan_steps: Vec<(&'static str, String, bool)>,
     confirm: Option<Confirm>,
     toast: Option<(String, bool)>,
     toast_until: Option<f64>,
@@ -114,7 +119,7 @@ fn init() -> App {
         name: discovery::computer_name(),
         sidebar: PaneState::new(280.0).range(200.0, 440.0),
         page: Page::Inventory,
-        inventory: None,
+        inventory: Inventory::load_cached(),
         scanning: false,
         collapsed: [Kind::Formula, Kind::Tap, Kind::VscodeExt, Kind::Defaults]
             .into_iter()
@@ -133,6 +138,8 @@ fn init() -> App {
         apply_log: Vec::new(),
         applied_ok: None,
         add_folder: None,
+        save_set: None,
+        scan_steps: Vec::new(),
         confirm: None,
         toast: None,
         toast_until: None,
@@ -245,14 +252,97 @@ impl App {
             return;
         }
         self.scanning = true;
+        self.scan_steps.clear();
         let folders = self.store.folders.clone();
+        let post = self.poster();
         self.bg(
-            move || inventory::scan(&folders),
+            move || {
+                let on = move |p: inventory::Progress| {
+                    post(Box::new(move |s: &mut App, _| s.scan_progress(p)));
+                };
+                let inv = inventory::scan(&folders, &on);
+                inv.save_cached();
+                inv
+            },
             |s, inv, _| {
                 s.scanning = false;
                 s.inventory = Some(inv);
             },
         );
+    }
+
+    fn scan_progress(&mut self, p: inventory::Progress) {
+        use inventory::Progress::*;
+        let (name, detail, done) = match p {
+            Start(n) => (n, String::new(), false),
+            Detail(n, d) => (n, d, false),
+            Done(n, d) => (n, d, true),
+        };
+        match self.scan_steps.iter_mut().find(|st| st.0 == name) {
+            // A late Detail from a parallel worker mustn't reopen a finished step.
+            Some(st) if !st.2 => *st = (name, detail, done),
+            Some(_) => {}
+            None => self.scan_steps.push((name, detail, done)),
+        }
+    }
+
+    fn save_set(&mut self) {
+        let Some(edit) = &self.save_set else { return };
+        let name = edit.text.trim().to_string();
+        if name.is_empty() {
+            return;
+        }
+        self.save_set = None;
+        self.store.save_set(&name);
+        self.save();
+        self.notify(format!("Saved as \u{201c}{name}\u{201d}"), false);
+    }
+
+    fn load_set(&mut self, name: &str) {
+        if !self.store.load_set(name) {
+            return;
+        }
+        self.save();
+        self.page = Page::Inventory;
+        self.sync_folders();
+    }
+
+    fn delete_set(&mut self, name: &str) {
+        self.confirm = None;
+        self.store.delete_set(name);
+        self.save();
+    }
+
+    /// Makes the inventory's folder items match the selection's folders, measuring new ones.
+    fn sync_folders(&mut self) {
+        let wanted = self.store.folders.clone();
+        let Some(inv) = &mut self.inventory else {
+            return;
+        };
+        inv.items
+            .retain(|i| i.kind != Kind::Folder || wanted.contains(&i.id));
+        let have: HashSet<String> = inv
+            .items
+            .iter()
+            .filter(|i| i.kind == Kind::Folder)
+            .map(|i| i.id.clone())
+            .collect();
+        for rel in wanted.into_iter().filter(|r| !have.contains(r)) {
+            self.bg(
+                move || inventory::folder_item(&rel),
+                |s, item, _| {
+                    if let Some(inv) = &mut s.inventory {
+                        inv.items.retain(|i| i.key() != item.key());
+                        let at = inv
+                            .items
+                            .iter()
+                            .position(|i| i.kind == Kind::Defaults)
+                            .unwrap_or(inv.items.len());
+                        inv.items.insert(at, item);
+                    }
+                },
+            );
+        }
     }
 
     fn start_network(&mut self) {
@@ -682,15 +772,64 @@ fn toast(k: &Kit, msg: &str, error: bool) -> El {
 }
 
 fn sidebar(s: &App, k: &Kit) -> El {
+    let set_label = match &s.store.active_set {
+        Some(n) => format!("{} · {n}", s.name),
+        None => s.name.clone(),
+    };
     let mut sb = Sidebar::new().header(
         SidebarRow::new("This Mac")
-            .subtitle(s.name.clone())
+            .subtitle(set_label)
             .icon(&rune_kit::glyphs::FOLDER)
             .height(44.0)
             .selected(s.page == Page::Inventory)
             .on_select(|s: &mut App, _| s.page = Page::Inventory)
             .build(k)
             .key("this-mac"),
+    );
+    let mut set_rows = Vec::new();
+    for name in s.store.sets.keys() {
+        let (n1, n2) = (name.clone(), name.clone());
+        let active = s.store.active_set.as_deref() == Some(name.as_str());
+        set_rows.push(
+            SidebarRow::new(name.clone())
+                .subtitle(if active {
+                    "In use; changes are saved to it"
+                } else {
+                    "Click to use"
+                })
+                .height(44.0)
+                .selected(active && s.page == Page::Inventory)
+                .on_select(move |s: &mut App, _| s.load_set(&n1))
+                .on_close(move |s: &mut App, _| s.confirm = Some(Confirm::DeleteSet(n2.clone())))
+                .build(k)
+                .key(format!("set/{name}")),
+        );
+    }
+    if s.store.sets.is_empty() {
+        set_rows.push(
+            SidebarRow::new("No saved sets")
+                .subtitle("Save what's ticked to reuse it")
+                .height(44.0)
+                .select_only()
+                .build(k)
+                .key("no-sets"),
+        );
+    }
+    sb = sb.section(
+        SidebarSection::new("Sets")
+            .key("sets")
+            .count(s.store.sets.len())
+            .action(
+                Button::new("Save as…")
+                    .variant(ButtonVariant::GhostFaint)
+                    .control_size(ControlSize::Small)
+                    .on_press(|s: &mut App| {
+                        let name = s.store.active_set.clone().unwrap_or_default();
+                        s.save_set = Some(TextEdit::new(&name));
+                    })
+                    .build(k),
+            )
+            .rows(set_rows),
     );
     let mut rows = Vec::new();
     if let Some(e) = &s.net_error {
@@ -951,15 +1090,54 @@ fn item_list(s: &App, k: &Kit, items: &[Item], list: List, editable: bool) -> El
     c
 }
 
+/// Each scan step with a spinner while it runs and a check when it's done.
+fn scan_steps(s: &App, k: &Kit) -> El {
+    let mut c = col().w_full().gap(6.0);
+    if s.scan_steps.is_empty() {
+        c = c.child(
+            row()
+                .gap(8.0)
+                .items_center()
+                .child(Spinner::new().build(k))
+                .child(muted(k, "Starting…")),
+        );
+    }
+    for (name, detail, done) in &s.scan_steps {
+        let mark = if *done {
+            text("✓").font(k.ty.ui).color(k.c.success.fg).w(16.0)
+        } else {
+            Spinner::new().build(k).w(16.0)
+        };
+        c = c.child(
+            row()
+                .w_full()
+                .gap(8.0)
+                .items_center()
+                .child(mark)
+                .child(text(name.to_string()).font(k.ty.ui).color(k.c.text_base))
+                .child(
+                    text(detail.clone())
+                        .font(k.ty.small)
+                        .color(k.c.text_faint)
+                        .truncate()
+                        .grow(1.0)
+                        .min_w(0.0),
+                )
+                .key(format!("step/{name}")),
+        );
+    }
+    c
+}
+
 fn inventory_page(s: &App, k: &Kit) -> El {
     let Some(inv) = &s.inventory else {
-        return col()
-            .w_full()
-            .h_full()
-            .center()
-            .gap(12.0)
-            .child(Spinner::new().build(k))
-            .child(muted(k, "Taking inventory of this Mac…"));
+        return col().w_full().h_full().center().child(
+            col()
+                .w(420.0)
+                .gap(12.0)
+                .child(heading(k, "Taking inventory of this Mac…"))
+                .child(scan_steps(s, k)),
+        );
     };
     let selected = s.selection();
     let mut c = col()
@@ -977,6 +1155,24 @@ fn inventory_page(s: &App, k: &Kit) -> El {
                      Settings, dotfiles and folders are copied, and anything they'd replace is backed up first.",
                 )),
         );
+    if s.scanning {
+        c = c.child(
+            col()
+                .w_full()
+                .padding(12.0)
+                .gap(8.0)
+                .radius(8.0)
+                .fill(k.c.layer_01)
+                .child(muted(
+                    k,
+                    format!(
+                        "Rescanning. Showing the scan from {} until it finishes.",
+                        date(inv.scanned)
+                    ),
+                ))
+                .child(scan_steps(s, k)),
+        );
+    }
     for n in &inv.notes {
         c = c.child(
             text(n.clone())
@@ -1209,6 +1405,7 @@ fn modal(
         .child(content)
         .on_close(|s: &mut App| {
             s.add_folder = None;
+            s.save_set = None;
             s.confirm = None;
         })
         .build(k, layer);
@@ -1219,6 +1416,7 @@ fn cancel(k: &Kit) -> El {
         .variant(ButtonVariant::Ghost)
         .on_press(|s: &mut App| {
             s.add_folder = None;
+            s.save_set = None;
             s.confirm = None;
         })
         .build(k)
@@ -1283,6 +1481,30 @@ fn dialogs(s: &App, k: &Kit, layer: &mut Vec<El>) {
             .on_close(|s: &mut App| s.answer(false))
             .build(k, layer);
         return;
+    }
+    if let Some(edit) = &s.save_set {
+        let input = TextInput::new(edit)
+            .placeholder("Work laptop")
+            .width(None)
+            .on_edit(|s: &mut App| s.save_set.as_mut().expect("dialog open"))
+            .on_submit(|s: &mut App, _| s.save_set())
+            .build(k);
+        let save = Button::new("Save")
+            .variant(ButtonVariant::Contrast)
+            .on_press(|s: &mut App| s.save_set())
+            .build(k);
+        modal(
+            "save-set",
+            "Save selection as a set",
+            Some(
+                "Keeps what's ticked and the folders you added under a name, to use again later. Changes you make while a set is in use are saved to it. Using an existing name replaces that set.",
+            ),
+            vec![input],
+            vec![cancel(k), save],
+            k,
+            layer,
+            460.0,
+        );
     }
     if let Some(edit) = &s.add_folder {
         let input = TextInput::new(edit)
@@ -1355,6 +1577,24 @@ fn dialogs(s: &App, k: &Kit, layer: &mut Vec<El>) {
                 k,
                 layer,
                 480.0,
+            );
+        }
+        Some(Confirm::DeleteSet(name)) => {
+            let name = name.clone();
+            let title = format!("Delete the set \u{201c}{name}\u{201d}?");
+            let go = Button::new("Delete")
+                .variant(ButtonVariant::Danger)
+                .on_press(move |s: &mut App| s.delete_set(&name))
+                .build(k);
+            modal(
+                "delete-set",
+                &title,
+                Some("What's ticked now stays as it is."),
+                vec![],
+                vec![cancel(k), go],
+                k,
+                layer,
+                420.0,
             );
         }
         Some(Confirm::Delete(id)) => {
@@ -1588,6 +1828,7 @@ fn demo(s: &mut App) {
     s.inventory = Some(Inventory {
         items: demo_items(),
         notes: Vec::new(),
+        scanned: 1_794_528_000,
     });
     s.peers = vec![Peer {
         id: "a1b2c3".into(),
@@ -1613,14 +1854,18 @@ fn main() {
     match args.get(1).map(String::as_str) {
         // `macpack brewfile`: the Brewfile a package from this Mac would install.
         Some("brewfile") => {
-            let inv = inventory::installs();
+            let inv = inventory::installs(&|_| {});
             let refs: Vec<&Item> = inv.items.iter().collect();
             print!("{}", package::brewfile(&refs));
             return;
         }
         // `macpack inventory`: everything on this Mac, as JSON.
         Some("inventory") => {
-            let inv = inventory::scan(&Store::load().folders);
+            let inv = inventory::scan(&Store::load().folders, &|p| {
+                if let inventory::Progress::Done(n, d) = p {
+                    eprintln!("{n}: {d}");
+                }
+            });
             println!(
                 "{}",
                 serde_json::to_string_pretty(&inv.items).unwrap_or_default()
@@ -1647,6 +1892,23 @@ fn main() {
                     bytes: Arc::new(AtomicU64::new(0)),
                     result: None,
                 });
+            }),
+            ("scanning", |s: &mut App| {
+                demo(s);
+                s.inventory = None;
+                s.scanning = true;
+                s.scan_steps = vec![
+                    ("Homebrew taps", "5 found".into(), true),
+                    ("Settings and dotfiles", "~/.config/zed".into(), false),
+                    ("Homebrew formulae", "35 found".into(), true),
+                    ("Apps from Homebrew", String::new(), false),
+                ];
+            }),
+            ("sets", |s: &mut App| {
+                demo(s);
+                s.store.save_set("Work laptop");
+                s.store.sets.insert("Personal".into(), Default::default());
+                s.save_set = Some(TextEdit::new("Work laptop"));
             }),
             ("incoming", |s: &mut App| {
                 demo(s);
