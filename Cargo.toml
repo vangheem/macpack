@@ -1,6 +1,6 @@
 [package]
 name = "macpack"
-version = "0.3.1"
+version = "0.4.0"
 edition = "2024"
 description = "Move your Mac setup to a new Mac: apps, dotfiles, SSH keys and folders, over an encrypted local connection"
 license = "MIT"
