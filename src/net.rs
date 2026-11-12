@@ -301,6 +301,51 @@ pub fn parse_addr(input: &str) -> Option<SocketAddr> {
     with_port.to_socket_addrs().ok()?.find(|a| a.is_ipv4())
 }
 
+/// Finds macpack on every host of the /24 networks of `mine` (this Mac's addresses), by
+/// connecting to [`PORT`] and pinging what answers. Takes a second or so.
+pub fn sweep(mine: &[std::net::Ipv4Addr]) -> Vec<crate::discovery::Peer> {
+    let targets: Vec<SocketAddr> = mine
+        .iter()
+        .flat_map(|ip| {
+            let [a, b, c, _] = ip.octets();
+            (1..255u8).map(move |d| std::net::Ipv4Addr::new(a, b, c, d))
+        })
+        .filter(|ip| !mine.contains(ip))
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .map(|ip| SocketAddr::new(ip.into(), PORT))
+        .collect();
+    let open: Vec<SocketAddr> = std::thread::scope(|sc| {
+        let hs: Vec<_> = targets
+            .chunks(4)
+            .map(|chunk| {
+                sc.spawn(move || {
+                    chunk
+                        .iter()
+                        .filter(|a| {
+                            TcpStream::connect_timeout(a, Duration::from_millis(400)).is_ok()
+                        })
+                        .copied()
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        hs.into_iter()
+            .flat_map(|h| h.join().unwrap_or_default())
+            .collect()
+    });
+    open.into_iter()
+        .filter_map(|addr| {
+            let (name, _) = ping(addr).ok()?;
+            Some(crate::discovery::Peer {
+                id: format!("lan:{addr}"),
+                name,
+                addr,
+            })
+        })
+        .collect()
+}
+
 /// This Mac's LAN addresses, to show so the other Mac can type one in.
 pub fn local_ips() -> Vec<std::net::Ipv4Addr> {
     let mut out = Vec::new();

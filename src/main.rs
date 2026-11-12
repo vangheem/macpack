@@ -86,6 +86,8 @@ struct App {
     /// Found on the network and added by hand, merged.
     peers: Vec<Peer>,
     found: Vec<Peer>,
+    /// Macs that answered on macpack's port when the local subnet was swept.
+    swept: Vec<Peer>,
     /// Manual peer id → its name and version once it answered, or why it didn't.
     reach: HashMap<String, Result<(String, String), String>>,
     /// The port this Mac listens on.
@@ -136,6 +138,7 @@ fn init() -> App {
             .collect(),
         peers: Vec::new(),
         found: Vec::new(),
+        swept: Vec::new(),
         reach: HashMap::new(),
         port: None,
         connect: None,
@@ -380,6 +383,19 @@ impl App {
         };
         self.port = Some(port);
         self.my_ips = net::local_ips();
+        // mDNS is often blocked (Local Network privacy, Wi-Fi client isolation of multicast),
+        // while plain TCP still works, so also sweep the subnet for macpack's port.
+        let (post, mine) = (self.poster(), self.my_ips.clone());
+        std::thread::spawn(move || {
+            loop {
+                let peers = net::sweep(&mine);
+                post(Box::new(move |s: &mut App, _| {
+                    s.swept = peers;
+                    s.merge_peers();
+                }));
+                std::thread::sleep(Duration::from_secs(30));
+            }
+        });
         for a in self.store.manual_peers.clone() {
             if let Some(addr) = net::parse_addr(&a) {
                 self.check_peer(addr);
@@ -400,6 +416,11 @@ impl App {
     /// Discovered Macs, then ones added by hand that discovery didn't also find.
     fn merge_peers(&mut self) {
         let mut all = self.found.clone();
+        for p in &self.swept {
+            if !all.iter().any(|q| q.addr.ip() == p.addr.ip()) {
+                all.push(p.clone());
+            }
+        }
         for a in &self.store.manual_peers {
             let Some(addr) = net::parse_addr(a) else {
                 continue;
@@ -2047,6 +2068,33 @@ fn main() {
                 "{}",
                 serde_json::to_string_pretty(&inv.items).unwrap_or_default()
             );
+            return;
+        }
+        // `macpack peers`: what discovery and the subnet sweep find, for troubleshooting.
+        Some("peers") => {
+            let store = Store::load();
+            let (tx, rx) = channel();
+            let _mdns = discovery::start(
+                &format!("{}-cli", store.device_id),
+                "macpack peers",
+                0,
+                move |p| {
+                    let _ = tx.send(p);
+                },
+            );
+            for p in net::sweep(&net::local_ips()) {
+                println!("sweep: {} at {}", p.name, p.addr);
+            }
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let mut seen = Vec::new();
+            while let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) {
+                if let Ok(p) = rx.recv_timeout(left) {
+                    seen = p;
+                }
+            }
+            for p in seen {
+                println!("mdns:  {} at {}", p.name, p.addr);
+            }
             return;
         }
         // `macpack ping 192.168.1.20`: checks that macpack answers at an address.

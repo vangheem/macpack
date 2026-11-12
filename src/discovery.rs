@@ -39,10 +39,12 @@ pub fn start(
             let changed = match ev {
                 ServiceEvent::ServiceResolved(info) => {
                     let id = instance(info.get_fullname());
+                    // Prefer LAN addresses over VPN ones (Tailscale and friends use 100.64/10).
                     let addr = info
                         .get_addresses_v4()
                         .into_iter()
-                        .find(|a| !a.is_loopback())
+                        .filter(|a| !a.is_loopback())
+                        .min_by_key(|a| !a.is_private())
                         .map(|a| IpAddr::V4(*a));
                     match addr {
                         Some(ip) if id != me => {
